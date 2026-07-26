@@ -201,11 +201,11 @@ async def _fetch_candles(symbol: str, interval: str = "15min", outputsize: int =
         r = await client.get(url, params=params)
 
     if r.status_code != 200:
-        raise HTTPException(502, "Failed to fetch chart data")
+        raise HTTPException(502, f"Twelve Data HTTP {r.status_code}: {r.text[:200]}")
 
     data = r.json()
     if data.get("status") == "error":
-        raise HTTPException(502, data.get("message", "Chart data source returned an error"))
+        raise HTTPException(502, f"Twelve Data error: {data.get('message', 'unknown')} (code {data.get('code')})")
 
     values = data.get("values", [])
     candles = [
@@ -246,7 +246,7 @@ async def get_chart(symbol: str, interval: str = "5min", outputsize: int = 100):
 
 sim_account = {"balance": 5000.0, "positions": []}  # positions: list of dicts
 _price_cache: Dict[str, tuple] = {}  # symbol -> (timestamp, price)
-PRICE_CACHE_TTL = 15  # seconds
+PRICE_CACHE_TTL = 30  # seconds
 
 # ---------------- Unified trade log ----------------
 # Every trade — manual, chat-triggered, or auto-traded, real or demo — is logged
@@ -1438,14 +1438,16 @@ async def chat(payload: dict = Body(...)):
     if not message:
         raise HTTPException(400, "message is required")
 
-    # Talk to a specific council AI directly, e.g. "@deepseek what do you think about gold"
-    addressed_ai = None
+    # Talk to a specific council AI directly — either via the dropdown (payload["ai"])
+    # or by typing "@deepseek ..." at the start of the message (kept for compatibility).
+    addressed_ai = payload.get("ai") if payload.get("ai") in ("groq", "deepseek", "gemini") else None
     stripped = message.strip()
-    for name in ("groq", "deepseek", "gemini"):
-        if stripped.lower().startswith(f"@{name}"):
-            addressed_ai = name
-            message = stripped[len(name) + 1:].strip(" :,-") or "What's your take?"
-            break
+    if not addressed_ai:
+        for name in ("groq", "deepseek", "gemini"):
+            if stripped.lower().startswith(f"@{name}"):
+                addressed_ai = name
+                message = stripped[len(name) + 1:].strip(" :,-") or "What's your take?"
+                break
 
     live_data = await _live_data_snapshot()
 
