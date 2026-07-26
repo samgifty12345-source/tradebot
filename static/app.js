@@ -534,8 +534,9 @@ async function sendChat() {
   const input = document.getElementById("chat-input");
   const message = input.value.trim();
   if (!message) return;
+  const ai = document.getElementById("chat-ai-select").value; // "" = team/auto, or "gemini"/"groq"/"deepseek"
   input.value = "";
-  appendChatBubble("user", message);
+  appendChatBubble("user", ai ? `[${ai}] ${message}` : message);
 
   const thinking = document.createElement("div");
   thinking.className = "chat-bubble chat-ai chat-thinking";
@@ -546,7 +547,7 @@ async function sendChat() {
     const res = await fetch(`${API_BASE}/api/chat`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ message }),
+      body: JSON.stringify({ message, ai: ai || null }),
     });
     const data = await res.json();
     thinking.remove();
