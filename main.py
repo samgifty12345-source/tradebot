@@ -673,7 +673,7 @@ def _smart_volume(symbol: str, confidence: float, entry_price=None, sl=None) -> 
 WATCHLIST = ["XAUUSD", "EURUSD", "GBPUSD", "USDJPY", "BTCUSD", "ETHUSD"]
 SCAN_TIMEFRAMES = ["15min", "30min", "1h", "4h"]
 MIN_CONFIDENCE = int(os.getenv("MIN_CONFIDENCE", "70"))
-GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")  # override via env var to try e.g. gemini-3-flash-preview
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-flash-latest")  # override via env var if needed
 
 SCAN_PROMPT = """You are a disciplined ICT / Smart Money Concepts trader scanning multiple pairs
 to find the single best trade opportunity right now.
