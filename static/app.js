@@ -157,6 +157,33 @@ function showDashboard() {
   setInterval(refreshPositions, 20000);
   setInterval(refreshAutotradeLog, 30000);
   setInterval(refreshTradeLog, 30000);
+  refreshAutotradeStatus();
+  setInterval(refreshAutotradeStatus, 5000);
+}
+
+let lastAutotradeNote = null;
+
+async function refreshAutotradeStatus() {
+  try {
+    const res = await fetch(`${API_BASE}/api/autotrade-status`);
+    if (!res.ok) return;
+    const status = await res.json();
+    const el = document.getElementById("autotrade-status");
+    if (status.state === "analyzing") {
+      lastAutotradeNote = null;
+      el.style.display = "flex";
+      el.classList.remove("done");
+      el.innerHTML = `<span class="spinner"></span> ${status.note || "Analyzing..."}`;
+    } else if (status.note && status.note !== lastAutotradeNote) {
+      lastAutotradeNote = status.note;
+      el.style.display = "flex";
+      el.classList.add("done");
+      el.innerHTML = `✅ ${status.note}`;
+      setTimeout(() => { el.style.display = "none"; el.classList.remove("done"); }, 6000);
+    }
+  } catch (err) {
+    // silent
+  }
 }
 
 function debounce(fn, wait) {
@@ -428,6 +455,20 @@ async function saveSettings() {
 
 // ---------- Trade log ----------
 
+function openTradeInChart(symbol) {
+  document.getElementById("chart-symbol").value = symbol;
+  loadChartHistory();
+  document.getElementById("chart-container").scrollIntoView({ behavior: "smooth", block: "center" });
+}
+
+function toggleTradeLog() {
+  const el = document.getElementById("trade-log");
+  const chevron = document.getElementById("tradelog-chevron");
+  const open = el.style.display !== "none";
+  el.style.display = open ? "none" : "block";
+  chevron.innerHTML = open ? "&#9656;" : "&#9662;";
+}
+
 async function refreshTradeLog() {
   try {
     const res = await fetch(`${API_BASE}/api/trades`);
@@ -441,7 +482,9 @@ async function refreshTradeLog() {
     }
     trades.slice(0, 30).forEach((t) => {
       const row = document.createElement("div");
-      row.className = "tradelog-row";
+      row.className = "tradelog-row tradelog-row-clickable";
+      row.title = `Click to open ${t.symbol} on the chart`;
+      row.onclick = () => openTradeInChart(t.symbol);
       const time = new Date(t.time).toLocaleString();
       const statusClass = t.status === "open" ? "tl-open" : "tl-closed";
       const pnlHtml = t.actual_pnl !== null && t.actual_pnl !== undefined
