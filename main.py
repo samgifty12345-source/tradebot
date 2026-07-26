@@ -221,9 +221,24 @@ async def _fetch_candles(symbol: str, interval: str = "15min", outputsize: int =
     return candles
 
 
+_chart_cache: Dict[str, tuple] = {}  # "symbol:interval:outputsize" -> (timestamp, candles)
+CHART_CACHE_TTL = 60  # seconds
+
+
 @app.get("/api/chart")
 async def get_chart(symbol: str, interval: str = "5min", outputsize: int = 100):
-    candles = await _fetch_candles(symbol, interval, outputsize)
+    key = f"{symbol.upper()}:{interval}:{outputsize}"
+    now = datetime.now(timezone.utc).timestamp()
+    cached = _chart_cache.get(key)
+    if cached and now - cached[0] < CHART_CACHE_TTL:
+        return {"symbol": symbol.upper(), "candles": cached[1]}
+    try:
+        candles = await _fetch_candles(symbol, interval, outputsize)
+    except HTTPException:
+        if cached:
+            return {"symbol": symbol.upper(), "candles": cached[1]}
+        raise
+    _chart_cache[key] = (now, candles)
     return {"symbol": symbol.upper(), "candles": candles}
 
 
@@ -344,8 +359,13 @@ async def _get_price(symbol: str) -> float:
     cached = _price_cache.get(symbol)
     if cached and now - cached[0] < PRICE_CACHE_TTL:
         return cached[1]
-    candles = await _fetch_candles(symbol, interval="1min", outputsize=1)
-    price = candles[-1]["close"] if candles else (cached[1] if cached else 0.0)
+    try:
+        candles = await _fetch_candles(symbol, interval="1min", outputsize=1)
+        price = candles[-1]["close"] if candles else (cached[1] if cached else 0.0)
+    except HTTPException:
+        if cached:
+            return cached[1]
+        raise
     _price_cache[symbol] = (now, price)
     return price
 
