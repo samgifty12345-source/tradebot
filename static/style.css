@@ -259,6 +259,16 @@ button {
 .chat-input-row { display: flex; gap: 8px; }
 .chat-input-row input { flex: 1; margin: 0; }
 .chat-send-btn { width: auto; margin: 0; padding: 11px 20px; }
+.chat-ai-select {
+  width: auto;
+  margin: 0;
+  padding: 0 10px;
+  background: #0e1218;
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  font-size: 13px;
+}
 
 .status-text { font-size: 13px; margin: 8px 0 0 0; min-height: 16px; }
 .error-text { color: var(--red); }
