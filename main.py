@@ -114,7 +114,9 @@ async def get_price(account_id: str, symbol: str):
     return price
 
 
-async def _place_trade(conn, symbol: str, side: str, volume: float, sl=None, tp=None):
+async def _place_trade(conn, symbol: str, side: str, volume: float, sl=None, tp=None,
+                        confidence=None, reason: str = "", source: str = "manual", account: str = "real"):
+    volume = _enforce_min_lot(symbol, volume)
     opts = {}
     if sl:
         opts["stop_loss"] = float(sl)
@@ -122,11 +124,28 @@ async def _place_trade(conn, symbol: str, side: str, volume: float, sl=None, tp=
         opts["take_profit"] = float(tp)
 
     if side == "buy":
-        return await conn.create_market_buy_order(symbol, float(volume), **opts)
+        result = await conn.create_market_buy_order(symbol, float(volume), **opts)
     elif side == "sell":
-        return await conn.create_market_sell_order(symbol, float(volume), **opts)
+        result = await conn.create_market_sell_order(symbol, float(volume), **opts)
     else:
         raise HTTPException(400, "side must be 'buy' or 'sell'")
+
+    position_id = (result or {}).get("positionId") or (result or {}).get("orderId") or uuid.uuid4().hex[:10]
+    entry_price = (result or {}).get("price")
+    if entry_price is None:
+        try:
+            price_info = await conn.get_symbol_price(symbol)
+            entry_price = price_info.get("ask") if side == "buy" else price_info.get("bid")
+        except Exception:
+            entry_price = None
+
+    if entry_price is not None:
+        _log_trade_open(
+            position_id=position_id, symbol=symbol, side=side, volume=volume, entry=entry_price,
+            sl=float(sl) if sl else None, tp=float(tp) if tp else None,
+            confidence=confidence, reason=reason, source=source, account=account,
+        )
+    return result
 
 
 @app.post("/api/trade/{account_id}")
@@ -141,13 +160,21 @@ async def place_trade(account_id: str, payload: dict = Body(...)):
     if not all([symbol, side, volume]):
         raise HTTPException(400, "symbol, side, volume are required")
 
-    return await _place_trade(conn, symbol, side, volume, sl, tp)
+    return await _place_trade(conn, symbol, side, volume, sl, tp, source="manual", account="real")
 
 
 @app.post("/api/close/{account_id}/{position_id}")
 async def close_position(account_id: str, position_id: str):
     conn = _get_connection(account_id)
     result = await conn.close_position(position_id)
+    pnl = (result or {}).get("profit") if isinstance(result, dict) else None
+    if pnl is not None:
+        _log_trade_close(position_id, pnl)
+    else:
+        for t in reversed(trade_log):
+            if t["id"] == position_id and t["status"] == "open":
+                t["status"] = "closed"
+                break
     return result
 
 
@@ -206,6 +233,49 @@ sim_account = {"balance": 5000.0, "positions": []}  # positions: list of dicts
 _price_cache: Dict[str, tuple] = {}  # symbol -> (timestamp, price)
 PRICE_CACHE_TTL = 15  # seconds
 
+# ---------------- Unified trade log ----------------
+# Every trade — manual, chat-triggered, or auto-traded, real or demo — is logged
+# here so the Chat AI and the Auto-Trading AI share one source of truth.
+trade_log = []  # newest last; persisted to GitHub
+
+
+def _log_trade_open(*, position_id: str, symbol: str, side: str, volume: float, entry: float,
+                     sl=None, tp=None, confidence=None, reason: str = "", source: str = "manual", account: str = "demo"):
+    expected_profit = _calc_pnl_dollars(symbol, side, entry, tp, volume) if tp else None
+    expected_loss = _calc_pnl_dollars(symbol, side, entry, sl, volume) if sl else None
+    record = {
+        "id": position_id,
+        "time": datetime.now(timezone.utc).isoformat(),
+        "symbol": symbol,
+        "side": side,
+        "volume": volume,
+        "entry": entry,
+        "sl": sl,
+        "tp": tp,
+        "risk_reward": _risk_reward(entry, sl, tp),
+        "expected_profit": round(expected_profit, 2) if expected_profit is not None else None,
+        "expected_loss": round(expected_loss, 2) if expected_loss is not None else None,
+        "actual_pnl": None,
+        "confidence": confidence,
+        "reason": reason,
+        "source": source,  # "manual" | "chat" | "autotrade" | "autotrade-sim"
+        "account": account,  # "real" | "demo"
+        "status": "open",
+    }
+    trade_log.append(record)
+    del trade_log[:-200]
+    return record
+
+
+def _log_trade_close(position_id: str, actual_pnl):
+    for t in reversed(trade_log):
+        if t["id"] == position_id and t["status"] == "open":
+            t["status"] = "closed"
+            t["actual_pnl"] = round(actual_pnl, 2) if actual_pnl is not None else None
+            t["closed_time"] = datetime.now(timezone.utc).isoformat()
+            return t
+    return None
+
 MAX_LOSS_USD = float(os.getenv("MAX_LOSS_USD", "300"))
 PROFIT_TARGET_USD = float(os.getenv("PROFIT_TARGET_USD", "300"))
 
@@ -213,6 +283,60 @@ PROFIT_TARGET_USD = float(os.getenv("PROFIT_TARGET_USD", "300"))
 # This is for realistic-feeling testing, not precise accounting.
 CONTRACT_SIZE = {"XAUUSD": 100, "BTCUSD": 1, "ETHUSD": 1}
 DEFAULT_CONTRACT_SIZE = 100000  # standard forex lot
+
+# ---------------- Asset classes, per-class minimum/default lot sizes ----------------
+
+MIN_LOT = {"crypto": 0.10, "gold": 0.01, "forex": 0.01}
+DEFAULT_LOT = {"crypto": 0.10, "gold": 0.02, "forex": 0.01}
+
+
+def _asset_class(symbol: str) -> str:
+    s = (symbol or "").upper()
+    if "BTC" in s or "ETH" in s:
+        return "crypto"
+    if "XAU" in s or "GOLD" in s:
+        return "gold"
+    return "forex"
+
+
+def _enforce_min_lot(symbol: str, volume: float) -> float:
+    """Crypto has a 0.10 minimum; Gold and Forex keep the 0.01 minimum."""
+    cls = _asset_class(symbol)
+    try:
+        volume = float(volume)
+    except (TypeError, ValueError):
+        volume = 0.0
+    return round(max(volume, MIN_LOT[cls]), 2)
+
+
+def _base_lot_for_symbol(symbol: str) -> float:
+    """User's saved preferred lot size for this asset class (Settings page),
+    falling back to a sane default, clamped to the class minimum."""
+    cls = _asset_class(symbol)
+    lot_key = {"crypto": "btc", "gold": "gold", "forex": "forex"}[cls]
+    base = (settings.get("lot_sizes") or {}).get(lot_key)
+    if not base:
+        base = DEFAULT_LOT[cls]
+    return round(max(float(base), MIN_LOT[cls]), 2)
+
+
+def _calc_pnl_dollars(symbol: str, side: str, entry_price: float, exit_price: float, volume: float) -> float:
+    """Dollar P/L for a position of `volume` lots moving from entry_price to
+    exit_price. Used for both live floating P/L and pre-trade profit/loss estimates."""
+    direction = 1 if side == "buy" else -1
+    contract = CONTRACT_SIZE.get(symbol, DEFAULT_CONTRACT_SIZE)
+    divisor = 1 if symbol in CONTRACT_SIZE else 10000  # keep forex P/L in a sane dollar range
+    return (exit_price - entry_price) * volume * contract * direction / divisor
+
+
+def _risk_reward(entry: float, sl: float, tp: float):
+    if not sl or not tp:
+        return None
+    risk = abs(entry - sl)
+    reward = abs(tp - entry)
+    if risk == 0:
+        return None
+    return round(reward / risk, 2)
 
 
 async def _get_price(symbol: str) -> float:
@@ -227,11 +351,7 @@ async def _get_price(symbol: str) -> float:
 
 
 def _sim_pnl(position: dict, current_price: float) -> float:
-    direction = 1 if position["side"] == "buy" else -1
-    contract = CONTRACT_SIZE.get(position["symbol"], DEFAULT_CONTRACT_SIZE)
-    return (current_price - position["entry_price"]) * position["volume"] * contract * direction / (
-        1 if position["symbol"] in CONTRACT_SIZE else 10000  # keep forex P/L in a sane dollar range
-    )
+    return _calc_pnl_dollars(position["symbol"], position["side"], position["entry_price"], current_price, position["volume"])
 
 
 @app.get("/api/sim/account")
@@ -257,7 +377,7 @@ async def sim_positions():
 async def sim_trade(payload: dict = Body(...)):
     symbol = (payload.get("symbol") or "").upper()
     side = payload.get("side")
-    volume = float(payload.get("volume") or 0.01)
+    volume = _enforce_min_lot(symbol, payload.get("volume") or 0.01)
     sl = payload.get("sl")
     tp = payload.get("tp")
 
@@ -276,6 +396,11 @@ async def sim_trade(payload: dict = Body(...)):
         "open_time": datetime.now(timezone.utc).isoformat(),
     }
     sim_account["positions"].append(pos)
+    _log_trade_open(
+        position_id=pos["id"], symbol=symbol, side=side, volume=volume, entry=price,
+        sl=pos["sl"], tp=pos["tp"], confidence=payload.get("confidence"),
+        reason=payload.get("reason", ""), source=payload.get("source", "manual"), account="demo",
+    )
     await _github_save_state()
     return pos
 
@@ -289,6 +414,7 @@ async def sim_close(position_id: str):
     pnl = _sim_pnl(pos, price)
     sim_account["balance"] += pnl
     sim_account["positions"].remove(pos)
+    _log_trade_close(position_id, pnl)
     await _github_save_state()
     return {"closed": True, "pnl": round(pnl, 2)}
 
@@ -453,9 +579,12 @@ async def _run_autotrade_sim():
             del autotrade_log[:-50]
             return
 
+        entry_price_est = await _get_price(best_symbol)
+        volume = _smart_volume(best_symbol, confidence, entry_price=entry_price_est, sl=scan.get("stop_loss"))
         pos = await sim_trade({
-            "symbol": best_symbol, "side": action, "volume": _confidence_volume(settings["volume"], confidence),
+            "symbol": best_symbol, "side": action, "volume": volume,
             "sl": scan.get("stop_loss"), "tp": scan.get("take_profit"),
+            "confidence": confidence, "reason": scan.get("reason", ""), "source": "autotrade-sim",
         })
         entry.update({"status": "trade_placed", "decision": scan, "result": pos})
         autotrade_log.append(entry)
@@ -496,7 +625,30 @@ settings = {
     "interval": "15min",
     "volume": TRADE_VOLUME_DEFAULT,
     "risk_notes": "",  # free-text risk preferences the AI should respect
+    "lot_sizes": {  # user's preferred base lot size per asset class (Settings page) — different
+        "gold": float(os.getenv("LOT_GOLD", "0.02")),  # prop firms have different leverage, so the
+        "btc": float(os.getenv("LOT_BTC", "0.10")),    # Auto Trader uses these instead of one tiny
+        "forex": float(os.getenv("LOT_FOREX", "0.01")),  # fixed size for every symbol.
+    },
 }
+
+
+def _smart_volume(symbol: str, confidence: float, entry_price=None, sl=None) -> float:
+    """Combines the user's saved per-asset lot size, confidence scaling (1x-3x),
+    and a hard risk cap so a position's stop-loss hit never exceeds MAX_LOSS_USD —
+    so good high-confidence trades size up instead of always making a few dollars,
+    while risk stays bounded."""
+    cls = _asset_class(symbol)
+    base = _base_lot_for_symbol(symbol)
+    scaled = _confidence_volume(base, confidence)
+
+    if entry_price is not None and sl:
+        risk_per_lot = abs(_calc_pnl_dollars(symbol, "buy", entry_price, sl, 1.0))
+        if risk_per_lot > 0:
+            max_lot_by_risk = MAX_LOSS_USD / risk_per_lot
+            scaled = min(scaled, max_lot_by_risk)
+
+    return round(max(scaled, MIN_LOT[cls]), 2)
 
 WATCHLIST = ["XAUUSD", "EURUSD", "GBPUSD", "USDJPY", "BTCUSD", "ETHUSD"]
 SCAN_TIMEFRAMES = ["15min", "30min", "1h", "4h"]
@@ -780,9 +932,18 @@ async def _run_autotrade():
             del autotrade_log[:-50]
             return
 
+        entry_price_est = None
+        try:
+            price_info = await conn.get_symbol_price(best_symbol)
+            entry_price_est = price_info.get("ask") if action == "buy" else price_info.get("bid")
+        except Exception:
+            pass
+        volume = _smart_volume(best_symbol, confidence, entry_price=entry_price_est, sl=scan.get("stop_loss"))
+
         result = await _place_trade(
-            conn, best_symbol, action, _confidence_volume(settings["volume"], confidence),
+            conn, best_symbol, action, volume,
             sl=scan.get("stop_loss"), tp=scan.get("take_profit"),
+            confidence=confidence, reason=scan.get("reason", ""), source="autotrade", account="real",
         )
         entry.update({"status": "trade_placed", "decision": scan, "result": str(result)})
         autotrade_log.append(entry)
@@ -836,7 +997,7 @@ async def _github_save_state():
     if not GITHUB_TOKEN or not GITHUB_REPO:
         return
     _, sha = await _github_get_state()
-    payload = {"settings": settings, "chat_history": chat_history[-40:], "sim_account": sim_account}
+    payload = {"settings": settings, "chat_history": chat_history[-40:], "sim_account": sim_account, "trade_log": trade_log[-200:]}
     content_b64 = base64.b64encode(json.dumps(payload, indent=2).encode()).decode()
     url = f"https://api.github.com/repos/{GITHUB_REPO}/contents/{STATE_FILE_PATH}"
     headers = {"Authorization": f"Bearer {GITHUB_TOKEN}", "Accept": "application/vnd.github+json"}
@@ -854,12 +1015,20 @@ chat_history = []  # list of {role, text} — persisted to GitHub
 async def _load_state_on_startup():
     state, _ = await _github_get_state()
     if state:
-        settings.update(state.get("settings", {}))
+        saved_settings = state.get("settings", {})
+        # merge lot_sizes rather than clobber, so new asset classes get their default
+        if saved_settings.get("lot_sizes"):
+            settings["lot_sizes"].update(saved_settings["lot_sizes"])
+            saved_settings = {k: v for k, v in saved_settings.items() if k != "lot_sizes"}
+        settings.update(saved_settings)
         chat_history.extend(state.get("chat_history", []))
         saved_sim = state.get("sim_account")
         if saved_sim:
             sim_account["balance"] = saved_sim.get("balance", sim_account["balance"])
             sim_account["positions"] = saved_sim.get("positions", [])
+        saved_trades = state.get("trade_log")
+        if saved_trades:
+            trade_log.extend(saved_trades)
 
 
 @app.get("/api/chat/history")
@@ -872,6 +1041,51 @@ async def get_settings():
     return settings
 
 
+@app.post("/api/settings")
+async def update_settings(payload: dict = Body(...)):
+    """Settings page: save preferred lot size per asset class (Gold/BTC/Forex)
+    and risk notes. The Auto Trader reads these via _base_lot_for_symbol/_smart_volume
+    instead of always using one tiny fixed lot."""
+    lot_sizes = payload.get("lot_sizes")
+    if lot_sizes:
+        sample_symbol = {"gold": "XAUUSD", "btc": "BTCUSD", "forex": "EURUSD"}
+        for key in ("gold", "btc", "forex"):
+            if lot_sizes.get(key) is not None:
+                settings["lot_sizes"][key] = _enforce_min_lot(sample_symbol[key], lot_sizes[key])
+    if payload.get("risk_notes") is not None:
+        settings["risk_notes"] = payload["risk_notes"]
+    if payload.get("volume") is not None:
+        settings["volume"] = float(payload["volume"])
+    await _github_save_state()
+    return settings
+
+
+@app.get("/api/trades")
+async def get_trades():
+    """Unified trade log — every trade taken (manual, chat, or auto), real or
+    demo, with entry/SL/TP/lot size/risk-reward/expected & actual P/L/confidence/reason."""
+    return list(reversed(trade_log))
+
+
+@app.get("/api/trade-preview")
+async def trade_preview(symbol: str, side: str, volume: float, sl: float = None, tp: float = None):
+    """Called before placing a trade so the UI can show real dollar amounts
+    (not just pips) for potential profit/loss and risk:reward."""
+    symbol = symbol.upper()
+    volume = _enforce_min_lot(symbol, volume)
+    price = await _get_price(symbol)
+    expected_profit = _calc_pnl_dollars(symbol, side, price, tp, volume) if tp else None
+    expected_loss = _calc_pnl_dollars(symbol, side, price, sl, volume) if sl else None
+    return {
+        "symbol": symbol,
+        "entry_estimate": price,
+        "volume": volume,
+        "expected_profit": round(expected_profit, 2) if expected_profit is not None else None,
+        "expected_loss": round(expected_loss, 2) if expected_loss is not None else None,
+        "risk_reward": _risk_reward(price, sl, tp) if sl and tp else None,
+    }
+
+
 CHAT_SYSTEM_PROMPT = """You are the trading assistant embedded in Icon's trading dashboard.
 You can chat normally about markets, strategy, and risk management.
 
@@ -881,10 +1095,18 @@ A trade only fires if a pair scores {min_confidence}+ confidence out of 100.
 Max loss per position: ${max_loss}, profit target: ${profit_target}.
 
 You also directly control: symbol={symbol}, timeframe={interval}, lot size={volume}, risk notes="{risk_notes}"
+Saved per-asset lot sizes (Settings page — the Auto Trader sizes from these, not a single fixed lot):
+Gold {lot_gold}, BTC/crypto {lot_btc}, Forex {lot_forex}
 (these are separate manual-trade defaults, distinct from the full watchlist scan above)
 
 You can place a trade immediately if the user explicitly asks (e.g. "buy gold now").
 Only trigger a trade on a clear, explicit instruction — never on your own initiative.
+
+IMPORTANT — you and the Auto-Trading AI share ONE unified trade log (below, under "Recent trades").
+It contains every trade either of you has taken, real or demo, with entry/SL/TP/lot size/risk-reward/
+expected P/L/actual P/L/confidence/reason. Always check it before answering questions like "did you buy
+gold" or "what happened to my trade" — if a trade is listed there, it WAS placed; never claim no trade
+was placed just because you personally didn't place it in this chat turn.
 
 LIVE DATA (use this — do not guess or use outdated training knowledge):
 {live_data}
@@ -943,6 +1165,20 @@ async def _live_data_snapshot():
         else:
             parts.append(f"Last auto-trade check: {last_entry.get('status')} — {last_entry.get('reason') or (last_entry.get('decision') or {}).get('reason', '')}")
 
+    if trade_log:
+        recent = trade_log[-6:]
+        lines = []
+        for t in recent:
+            pnl_str = f", actual P/L ${t['actual_pnl']}" if t.get("actual_pnl") is not None else ""
+            exp_str = f", expected profit ${t['expected_profit']}/loss ${t['expected_loss']}" if t.get("expected_profit") is not None or t.get("expected_loss") is not None else ""
+            rr_str = f", R:R 1:{t['risk_reward']}" if t.get("risk_reward") is not None else ""
+            conf_str = f", {t['confidence']}% confidence" if t.get("confidence") is not None else ""
+            lines.append(
+                f"[{t['status'].upper()}] {t['time']}: {t['side'].upper()} {t['volume']} lots {t['symbol']} @ {t['entry']} "
+                f"(SL {t.get('sl')}, TP {t.get('tp')}{rr_str}{exp_str}{conf_str}) via {t['source']}/{t['account']}{pnl_str} — {t.get('reason','')}"
+            )
+        parts.append("Recent trades (unified trade log, shared with Auto-Trading AI):\n" + "\n".join(lines))
+
     return "\n".join(parts)
 
 
@@ -968,6 +1204,9 @@ async def chat(payload: dict = Body(...)):
         min_confidence=MIN_CONFIDENCE,
         max_loss=MAX_LOSS_USD,
         profit_target=PROFIT_TARGET_USD,
+        lot_gold=settings["lot_sizes"]["gold"],
+        lot_btc=settings["lot_sizes"]["btc"],
+        lot_forex=settings["lot_sizes"]["forex"],
     )
 
     contents = [{"role": h["role"], "parts": [{"text": h["text"]}]} for h in chat_history[-20:]]
@@ -1019,7 +1258,7 @@ async def chat(payload: dict = Body(...)):
 
     if trade_action and trade_action.get("side") in ("buy", "sell"):
         trade_symbol = trade_action.get("symbol") or settings["symbol"]
-        trade_volume = trade_action.get("volume") or settings["volume"]
+        trade_volume = _enforce_min_lot(trade_symbol, trade_action.get("volume") or _base_lot_for_symbol(trade_symbol))
 
         real_account_available = all([MT_LOGIN, MT_PASSWORD, MT_SERVER])
         placed_on = None
@@ -1030,6 +1269,7 @@ async def chat(payload: dict = Body(...)):
                 result = await _place_trade(
                     conn, trade_symbol, trade_action["side"], trade_volume,
                     sl=trade_action.get("stop_loss"), tp=trade_action.get("take_profit"),
+                    reason="Manual command via chat", source="chat", account="real",
                 )
                 placed_on = "real"
             except Exception as e:
@@ -1042,6 +1282,7 @@ async def chat(payload: dict = Body(...)):
             result = await sim_trade({
                 "symbol": trade_symbol, "side": trade_action["side"], "volume": trade_volume,
                 "sl": trade_action.get("stop_loss"), "tp": trade_action.get("take_profit"),
+                "reason": "Manual command via chat", "source": "chat",
             })
             placed_on = "demo"
 
