@@ -458,22 +458,11 @@ async def _ask_manage_gemini(pos: dict, candles: list, pnl: float) -> dict:
         max_loss=MAX_LOSS_USD, profit_target=PROFIT_TARGET_USD,
         interval=settings["interval"], candles_json=json.dumps(candles),
     )
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent"
-    headers = {"x-goog-api-key": GEMINI_API_KEY, "Content-Type": "application/json"}
-    body = {"contents": [{"parts": [{"text": prompt}]}]}
-    async with httpx.AsyncClient(timeout=60) as client:
-        r = await client.post(url, headers=headers, json=body)
-    if r.status_code != 200:
-        return {"close": False, "reason": "management check failed"}
     try:
-        text = r.json()["candidates"][0]["content"]["parts"][0]["text"].strip()
-        if text.startswith("```"):
-            text = text.strip("`")
-            if text.lower().startswith("json"):
-                text = text[4:]
-        return json.loads(text.strip())
+        text = await _call_llm_text(prompt, timeout=60)
+        return json.loads(_clean_json_text(text))
     except Exception:
-        return {"close": False, "reason": "couldn't parse management response"}
+        return {"close": False, "reason": "management check failed"}
 
 
 async def _manage_sim_positions():
@@ -565,6 +554,7 @@ def _confidence_volume(base_volume: float, confidence: float) -> float:
 
 
 async def _run_autotrade_sim():
+    autotrade_status.update({"state": "analyzing", "since": datetime.now(timezone.utc).isoformat(), "note": "Scanning watchlist..."})
     entry = {"time": datetime.now(timezone.utc).isoformat()}
     entry["market"] = _market_status()  # logged only — not enforced yet, per Icon's instruction
 
@@ -581,11 +571,14 @@ async def _run_autotrade_sim():
             entry.update({"status": "skipped", "reason": f"{len(sim_account['positions'])} open sim position(s)"})
             autotrade_log.append(entry)
             del autotrade_log[:-50]
+            autotrade_status.update({"state": "idle", "note": "Skipped — max open positions"})
             return
 
         pairs_data = await _fetch_multi_snapshot()
         if pairs_data.get("_fetch_errors"):
             entry["fetch_errors"] = pairs_data["_fetch_errors"]
+
+        autotrade_status["note"] = "Lead AI analyzing setups..."
         scan = await _ask_gemini_scan(pairs_data, entry.get("news_check", "not checked this run"))
         entry["scanned"] = scan.get("scanned", {})
 
@@ -597,22 +590,87 @@ async def _run_autotrade_sim():
             entry.update({"status": "hold", "decision": scan})
             autotrade_log.append(entry)
             del autotrade_log[:-50]
+            autotrade_status.update({"state": "idle", "note": "Hold — no setup met the confidence bar"})
+            opinion = await _ask_deepseek_opinion(
+                f"Decision: HOLD (no pair met the {MIN_CONFIDENCE}+ confidence threshold). "
+                f"Full scan: {json.dumps(scan)[:2000]}"
+            )
+            if opinion:
+                deepseek_review["time"] = datetime.now(timezone.utc).isoformat()
+                deepseek_review["text"] = opinion
             return
 
-        entry_price_est = await _get_price(best_symbol)
-        volume = _smart_volume(best_symbol, confidence, entry_price=entry_price_est, sl=scan.get("stop_loss"))
+        # Council check — DeepSeek reviews the lead AI's decision before it's allowed to fire.
+        autotrade_status["note"] = f"Council reviewing {action.upper()} {best_symbol}..."
+        council_context = (
+            f"Decision: {action.upper()} {best_symbol}, confidence {confidence}%, "
+            f"reason: {scan.get('reason', '')}. Full scan: {json.dumps(scan)[:2000]}"
+        )
+        verdict = await _ask_deepseek_verdict(council_context)
+
+        if verdict is not None and verdict.get("agree") is False:
+            entry.update({
+                "status": "hold",
+                "decision": scan,
+                "council": {"lead_action": action, "lead_symbol": best_symbol, "deepseek_agree": False, "deepseek_note": verdict.get("note")},
+            })
+            autotrade_log.append(entry)
+            del autotrade_log[:-50]
+            deepseek_review["time"] = datetime.now(timezone.utc).isoformat()
+            deepseek_review["text"] = f"Vetoed {action.upper()} {best_symbol}: {verdict.get('note', '')}"
+            autotrade_status.update({"state": "idle", "note": f"Council split — DeepSeek vetoed {action.upper()} {best_symbol}"})
+            return
+
+        # Staleness check — re-fetch price right before executing, since council deliberation
+        # takes real time and a demo fill at a stale price wouldn't be a valid fill in real life.
+        price_at_scan = await _get_price(best_symbol)
+        autotrade_status["note"] = f"Confirming price before executing {action.upper()} {best_symbol}..."
+        price_now = await _get_price(best_symbol)
+        moved_pct = abs(price_now - price_at_scan) / price_at_scan * 100 if price_at_scan else 0
+
+        if moved_pct > PRICE_STALENESS_PCT:
+            entry.update({
+                "status": "hold",
+                "decision": scan,
+                "reason": f"Price moved {moved_pct:.3f}% (>{PRICE_STALENESS_PCT}%) between decision and execution — stale, skipped",
+            })
+            autotrade_log.append(entry)
+            del autotrade_log[:-50]
+            autotrade_status.update({"state": "idle", "note": "Skipped — price moved too much before execution"})
+            return
+
+        volume = _smart_volume(best_symbol, confidence, entry_price=price_now, sl=scan.get("stop_loss"))
         pos = await sim_trade({
             "symbol": best_symbol, "side": action, "volume": volume,
             "sl": scan.get("stop_loss"), "tp": scan.get("take_profit"),
             "confidence": confidence, "reason": scan.get("reason", ""), "source": "autotrade-sim",
         })
-        entry.update({"status": "trade_placed", "decision": scan, "result": pos})
+        entry.update({
+            "status": "trade_placed",
+            "decision": scan,
+            "result": pos,
+            "council": {"lead_action": action, "lead_symbol": best_symbol, "deepseek_agree": None if verdict is None else True, "deepseek_note": (verdict or {}).get("note")},
+        })
         autotrade_log.append(entry)
         del autotrade_log[:-50]
+        autotrade_status.update({"state": "idle", "note": f"Placed {action.upper()} {volume} lots on {best_symbol}"})
+        opinion = await _ask_deepseek_opinion(
+            f"Decision: {action.upper()} {best_symbol} @ {volume} lots, confidence {confidence}%, "
+            f"reason: {scan.get('reason', '')}. Full scan: {json.dumps(scan)[:2000]}"
+        )
+        if opinion:
+            deepseek_review["time"] = datetime.now(timezone.utc).isoformat()
+            deepseek_review["text"] = opinion
     except Exception as e:
         entry.update({"status": "error", "reason": str(e)})
         autotrade_log.append(entry)
         del autotrade_log[:-50]
+        autotrade_status.update({"state": "idle", "note": f"Error: {str(e)[:120]}"})
+
+
+@app.get("/api/autotrade-status")
+async def get_autotrade_status():
+    return autotrade_status
 
 
 @app.get("/api/autotrade-sim")
@@ -630,6 +688,10 @@ async def autotrade_sim(secret: str = Query(...), background_tasks: BackgroundTa
 # ---------------- Autotrade (AI-driven, triggered by a free external cron) ----------------
 
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
+GROQ_API_KEY = os.getenv("GROQ_API_KEY", "")
+GROQ_MODEL = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
+DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY", "")
+DEEPSEEK_MODEL = os.getenv("DEEPSEEK_MODEL", "deepseek-chat")
 AUTOTRADE_SECRET = os.getenv("AUTOTRADE_SECRET", "")
 MT_LOGIN = os.getenv("MT_LOGIN", "")
 MT_PASSWORD = os.getenv("MT_PASSWORD", "")
@@ -674,6 +736,201 @@ WATCHLIST = ["XAUUSD", "EURUSD", "GBPUSD", "USDJPY", "BTCUSD", "ETHUSD"]
 SCAN_TIMEFRAMES = ["15min", "30min", "1h", "4h"]
 MIN_CONFIDENCE = int(os.getenv("MIN_CONFIDENCE", "70"))
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-flash-latest")  # override via env var if needed
+
+
+def _clean_json_text(text: str) -> str:
+    text = text.strip()
+    if text.startswith("```"):
+        text = text.strip("`")
+        if text.lower().startswith("json"):
+            text = text[4:]
+    return text.strip()
+
+
+async def _call_gemini_raw(prompt: str, timeout=90) -> str:
+    if not GEMINI_API_KEY:
+        raise RuntimeError("GEMINI_API_KEY not set")
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent"
+    headers = {"x-goog-api-key": GEMINI_API_KEY, "Content-Type": "application/json"}
+    body = {"contents": [{"parts": [{"text": prompt}]}]}
+    async with httpx.AsyncClient(timeout=timeout) as client:
+        r = await client.post(url, headers=headers, json=body)
+    if r.status_code != 200:
+        raise RuntimeError(f"Gemini failed: {r.text[:300]}")
+    try:
+        return r.json()["candidates"][0]["content"]["parts"][0]["text"]
+    except (KeyError, IndexError):
+        raise RuntimeError(f"Unexpected Gemini response: {r.text[:300]}")
+
+
+async def _call_groq_raw(prompt: str, timeout=90) -> str:
+    if not GROQ_API_KEY:
+        raise RuntimeError("GROQ_API_KEY not set")
+    url = "https://api.groq.com/openai/v1/chat/completions"
+    headers = {"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"}
+    body = {"model": GROQ_MODEL, "messages": [{"role": "user", "content": prompt}], "temperature": 0.3}
+    async with httpx.AsyncClient(timeout=timeout) as client:
+        r = await client.post(url, headers=headers, json=body)
+    if r.status_code != 200:
+        raise RuntimeError(f"Groq failed: {r.text[:300]}")
+    try:
+        return r.json()["choices"][0]["message"]["content"]
+    except (KeyError, IndexError):
+        raise RuntimeError(f"Unexpected Groq response: {r.text[:300]}")
+
+
+async def _call_llm_text(prompt: str, timeout=90) -> str:
+    """Single-turn call for JSON-schema prompts (scan/strategy/manage). Tries Gemini
+    first, falls back to Groq automatically if Gemini is down/quota-blocked."""
+    errors = []
+    for name, fn in (("Gemini", _call_gemini_raw), ("Groq", _call_groq_raw)):
+        try:
+            return await fn(prompt, timeout=timeout)
+        except Exception as e:
+            errors.append(f"{name}: {e}")
+    raise HTTPException(502, "All LLM providers failed: " + " | ".join(errors))
+
+
+async def _call_gemini_chat_raw(system: str, history: list, message: str, timeout=60) -> str:
+    if not GEMINI_API_KEY:
+        raise RuntimeError("GEMINI_API_KEY not set")
+    contents = [{"role": h["role"], "parts": [{"text": h["text"]}]} for h in history]
+    contents.append({"role": "user", "parts": [{"text": message}]})
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent"
+    headers = {"x-goog-api-key": GEMINI_API_KEY, "Content-Type": "application/json"}
+    body = {"system_instruction": {"parts": [{"text": system}]}, "contents": contents}
+    async with httpx.AsyncClient(timeout=timeout) as client:
+        r = await client.post(url, headers=headers, json=body)
+    if r.status_code != 200:
+        raise RuntimeError(f"Gemini failed: {r.text[:300]}")
+    try:
+        return r.json()["candidates"][0]["content"]["parts"][0]["text"]
+    except (KeyError, IndexError):
+        raise RuntimeError(f"Unexpected Gemini response: {r.text[:300]}")
+
+
+async def _call_groq_chat_raw(system: str, history: list, message: str, timeout=60) -> str:
+    if not GROQ_API_KEY:
+        raise RuntimeError("GROQ_API_KEY not set")
+    messages = [{"role": "system", "content": system}]
+    for h in history:
+        messages.append({"role": "assistant" if h["role"] == "model" else "user", "content": h["text"]})
+    messages.append({"role": "user", "content": message})
+    url = "https://api.groq.com/openai/v1/chat/completions"
+    headers = {"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"}
+    body = {"model": GROQ_MODEL, "messages": messages, "temperature": 0.4}
+    async with httpx.AsyncClient(timeout=timeout) as client:
+        r = await client.post(url, headers=headers, json=body)
+    if r.status_code != 200:
+        raise RuntimeError(f"Groq failed: {r.text[:300]}")
+    try:
+        return r.json()["choices"][0]["message"]["content"]
+    except (KeyError, IndexError):
+        raise RuntimeError(f"Unexpected Groq response: {r.text[:300]}")
+
+
+async def _call_deepseek_chat_raw(system: str, history: list, message: str, timeout=60) -> str:
+    if not DEEPSEEK_API_KEY:
+        raise RuntimeError("DEEPSEEK_API_KEY not set")
+    messages = [{"role": "system", "content": system}]
+    for h in history:
+        messages.append({"role": "assistant" if h["role"] == "model" else "user", "content": h["text"]})
+    messages.append({"role": "user", "content": message})
+    url = "https://api.deepseek.com/chat/completions"
+    headers = {"Authorization": f"Bearer {DEEPSEEK_API_KEY}", "Content-Type": "application/json"}
+    body = {"model": DEEPSEEK_MODEL, "messages": messages, "temperature": 0.4}
+    async with httpx.AsyncClient(timeout=timeout) as client:
+        r = await client.post(url, headers=headers, json=body)
+    if r.status_code != 200:
+        raise RuntimeError(f"DeepSeek failed: {r.text[:300]}")
+    try:
+        return r.json()["choices"][0]["message"]["content"]
+    except (KeyError, IndexError):
+        raise RuntimeError(f"Unexpected DeepSeek response: {r.text[:300]}")
+
+
+async def _call_llm_chat(system: str, history: list, message: str, timeout=60) -> str:
+    """Multi-turn call for the chat endpoint. Tries Gemini first, falls back to Groq."""
+    errors = []
+    for name, fn in (("Gemini", _call_gemini_chat_raw), ("Groq", _call_groq_chat_raw)):
+        try:
+            return await fn(system, history, message, timeout=timeout)
+        except Exception as e:
+            errors.append(f"{name}: {e}")
+    raise HTTPException(502, "All LLM providers failed: " + " | ".join(errors))
+
+
+# Latest DeepSeek second-opinion — set after each autotrade scan, readable by the chat AI
+# so the trading AI and chat AI's combined findings get a third perspective.
+deepseek_review = {"time": None, "text": None}
+
+# Live status of the current scan cycle — polled by the frontend to show a "thinking" indicator.
+autotrade_status = {"state": "idle", "since": None, "note": None}
+
+PRICE_STALENESS_PCT = float(os.getenv("PRICE_STALENESS_PCT", "0.15"))  # abort trade if price moved >0.15% since scan
+
+DEEPSEEK_VERDICT_PROMPT = """You are the second seat on a two-AI trading council. The lead AI just
+finished a scan cycle and wants to act on this decision:
+
+{context}
+
+Give your independent verdict. Respond with ONLY raw JSON (no markdown), in exactly this shape:
+{{"agree": true|false, "note": "one short sentence explaining your verdict"}}
+Disagree only if you see a real, specific flaw (bad risk:reward, conflicting structure, over-extension).
+Default to agree if the setup looks reasonable — you are a check, not a competing strategy."""
+
+
+async def _ask_deepseek_verdict(context: str) -> dict | None:
+    """Structured agree/disagree verdict used to gate trade execution. Returns None (no veto)
+    if DeepSeek is unavailable — the council falls back to the lead AI's decision alone."""
+    if not DEEPSEEK_API_KEY:
+        return None
+    try:
+        url = "https://api.deepseek.com/chat/completions"
+        headers = {"Authorization": f"Bearer {DEEPSEEK_API_KEY}", "Content-Type": "application/json"}
+        body = {
+            "model": DEEPSEEK_MODEL,
+            "messages": [{"role": "user", "content": DEEPSEEK_VERDICT_PROMPT.format(context=context)}],
+            "temperature": 0.2,
+        }
+        async with httpx.AsyncClient(timeout=45) as client:
+            r = await client.post(url, headers=headers, json=body)
+        if r.status_code != 200:
+            return None
+        text = _clean_json_text(r.json()["choices"][0]["message"]["content"])
+        return json.loads(text)
+    except Exception:
+        return None
+
+DEEPSEEK_REVIEW_PROMPT = """You are a second-opinion trading reviewer. The primary trading AI just
+finished a scan cycle. Here is what it found and decided:
+
+{context}
+
+In 2-3 sentences, give your own independent take: do you agree with the decision, and is there
+anything the primary AI may have missed or gotten wrong? Be direct and concise — no markdown, no
+JSON, just plain text commentary."""
+
+
+async def _ask_deepseek_opinion(context: str) -> str | None:
+    """Best-effort — never raises, never blocks the autotrade cycle if DeepSeek is unavailable."""
+    if not DEEPSEEK_API_KEY:
+        return None
+    try:
+        url = "https://api.deepseek.com/chat/completions"
+        headers = {"Authorization": f"Bearer {DEEPSEEK_API_KEY}", "Content-Type": "application/json"}
+        body = {
+            "model": DEEPSEEK_MODEL,
+            "messages": [{"role": "user", "content": DEEPSEEK_REVIEW_PROMPT.format(context=context)}],
+            "temperature": 0.3,
+        }
+        async with httpx.AsyncClient(timeout=60) as client:
+            r = await client.post(url, headers=headers, json=body)
+        if r.status_code != 200:
+            return None
+        return r.json()["choices"][0]["message"]["content"].strip()
+    except Exception:
+        return None
 
 SCAN_PROMPT = """You are a disciplined ICT / Smart Money Concepts trader scanning multiple pairs
 to find the single best trade opportunity right now.
@@ -787,8 +1044,8 @@ async def _fetch_multi_snapshot():
 
 
 async def _ask_gemini_scan(pairs_data: dict, news_context: str = "not checked this run") -> dict:
-    if not GEMINI_API_KEY:
-        raise HTTPException(500, "GEMINI_API_KEY is not set on the server")
+    if not GEMINI_API_KEY and not GROQ_API_KEY:
+        raise HTTPException(500, "Neither GEMINI_API_KEY nor GROQ_API_KEY is set on the server")
 
     prompt = SCAN_PROMPT.format(
         risk_notes=settings["risk_notes"] or "No specific preferences stated — use conservative default risk management.",
@@ -797,33 +1054,12 @@ async def _ask_gemini_scan(pairs_data: dict, news_context: str = "not checked th
         pairs_json=json.dumps(pairs_data),
     )
 
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent"
-    headers = {"x-goog-api-key": GEMINI_API_KEY, "Content-Type": "application/json"}
-    body = {"contents": [{"parts": [{"text": prompt}]}]}
-
-    async with httpx.AsyncClient(timeout=90) as client:
-        r = await client.post(url, headers=headers, json=body)
-
-    if r.status_code != 200:
-        raise HTTPException(502, f"Gemini call failed: {r.text[:300]}")
-
-    data = r.json()
-    try:
-        text = data["candidates"][0]["content"]["parts"][0]["text"]
-    except (KeyError, IndexError):
-        raise HTTPException(502, f"Unexpected Gemini response: {json.dumps(data)[:300]}")
-
-    text = text.strip()
-    if text.startswith("```"):
-        text = text.strip("`")
-        if text.lower().startswith("json"):
-            text = text[4:]
-    text = text.strip()
-
+    text = await _call_llm_text(prompt, timeout=90)
+    text = _clean_json_text(text)
     try:
         return json.loads(text)
     except json.JSONDecodeError:
-        raise HTTPException(502, f"Gemini did not return valid JSON: {text[:300]}")
+        raise HTTPException(502, f"LLM did not return valid JSON: {text[:300]}")
 
 STRATEGY_PROMPT = """You are a disciplined ICT / Smart Money Concepts forex and gold trader.
 You will be given the most recent {n} candles for {symbol} on the {interval} timeframe,
@@ -846,8 +1082,8 @@ Candles:
 
 
 async def _ask_gemini(symbol: str, interval: str, candles: list) -> dict:
-    if not GEMINI_API_KEY:
-        raise HTTPException(500, "GEMINI_API_KEY is not set on the server")
+    if not GEMINI_API_KEY and not GROQ_API_KEY:
+        raise HTTPException(500, "Neither GEMINI_API_KEY nor GROQ_API_KEY is set on the server")
 
     prompt = STRATEGY_PROMPT.format(
         n=len(candles),
@@ -857,33 +1093,13 @@ async def _ask_gemini(symbol: str, interval: str, candles: list) -> dict:
         candles_json=json.dumps(candles),
     )
 
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent"
-    headers = {"x-goog-api-key": GEMINI_API_KEY, "Content-Type": "application/json"}
-    body = {"contents": [{"parts": [{"text": prompt}]}]}
-
-    async with httpx.AsyncClient(timeout=60) as client:
-        r = await client.post(url, headers=headers, json=body)
-
-    if r.status_code != 200:
-        raise HTTPException(502, f"Gemini call failed: {r.text[:300]}")
-
-    data = r.json()
-    try:
-        text = data["candidates"][0]["content"]["parts"][0]["text"]
-    except (KeyError, IndexError):
-        raise HTTPException(502, f"Unexpected Gemini response: {json.dumps(data)[:300]}")
-
-    text = text.strip()
-    if text.startswith("```"):
-        text = text.strip("`")
-        if text.lower().startswith("json"):
-            text = text[4:]
-    text = text.strip()
+    text = await _call_llm_text(prompt, timeout=60)
+    text = _clean_json_text(text)
 
     try:
         decision = json.loads(text)
     except json.JSONDecodeError:
-        raise HTTPException(502, f"Gemini did not return valid JSON: {text[:300]}")
+        raise HTTPException(502, f"LLM did not return valid JSON: {text[:300]}")
 
     return decision
 
@@ -1131,6 +1347,10 @@ was placed just because you personally didn't place it in this chat turn.
 LIVE DATA (use this — do not guess or use outdated training knowledge):
 {live_data}
 
+DeepSeek's independent second opinion on the last scan cycle (if the user asks what DeepSeek
+thinks, or wants a second opinion, relay this — do not claim you have no access to it):
+{deepseek_review}
+
 If the user asks to change the pair, timeframe, lot size, or states a risk management
 preference, update it via settings_update. Timeframe must be one of: 1min, 5min, 15min, 1h, 4h, 1day.
 Symbol should be a 6-letter forex/metal pair like XAUUSD, EURUSD, GBPUSD (no slash).
@@ -1211,14 +1431,28 @@ async def _live_data_snapshot():
 
 @app.post("/api/chat")
 async def chat(payload: dict = Body(...)):
-    if not GEMINI_API_KEY:
-        raise HTTPException(500, "GEMINI_API_KEY is not set on the server")
+    if not GEMINI_API_KEY and not GROQ_API_KEY:
+        raise HTTPException(500, "Neither GEMINI_API_KEY nor GROQ_API_KEY is set on the server")
 
     message = payload.get("message", "")
     if not message:
         raise HTTPException(400, "message is required")
 
+    # Talk to a specific council AI directly, e.g. "@deepseek what do you think about gold"
+    addressed_ai = None
+    stripped = message.strip()
+    for name in ("groq", "deepseek", "gemini"):
+        if stripped.lower().startswith(f"@{name}"):
+            addressed_ai = name
+            message = stripped[len(name) + 1:].strip(" :,-") or "What's your take?"
+            break
+
     live_data = await _live_data_snapshot()
+
+    if deepseek_review["text"]:
+        deepseek_review_str = f"[{deepseek_review['time']}] {deepseek_review['text']}"
+    else:
+        deepseek_review_str = "No DeepSeek review yet (set DEEPSEEK_API_KEY, or wait for the next autotrade scan)."
 
     system = CHAT_SYSTEM_PROMPT.format(
         symbol=settings["symbol"],
@@ -1226,6 +1460,7 @@ async def chat(payload: dict = Body(...)):
         volume=settings["volume"],
         risk_notes=settings["risk_notes"] or "none set",
         live_data=live_data,
+        deepseek_review=deepseek_review_str,
         watchlist=", ".join(WATCHLIST),
         scan_timeframes=", ".join(SCAN_TIMEFRAMES),
         min_confidence=MIN_CONFIDENCE,
@@ -1236,31 +1471,21 @@ async def chat(payload: dict = Body(...)):
         lot_forex=settings["lot_sizes"]["forex"],
     )
 
-    contents = [{"role": h["role"], "parts": [{"text": h["text"]}]} for h in chat_history[-20:]]
-    contents.append({"role": "user", "parts": [{"text": message}]})
+    history = [{"role": h["role"], "text": h["text"]} for h in chat_history[-20:]]
 
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent"
-    headers = {"x-goog-api-key": GEMINI_API_KEY, "Content-Type": "application/json"}
-    body = {"system_instruction": {"parts": [{"text": system}]}, "contents": contents}
-
-    async with httpx.AsyncClient(timeout=60) as client:
-        r = await client.post(url, headers=headers, json=body)
-
-    if r.status_code != 200:
-        raise HTTPException(502, f"Gemini call failed: {r.text[:300]}")
-
-    data = r.json()
-    try:
-        text = data["candidates"][0]["content"]["parts"][0]["text"]
-    except (KeyError, IndexError):
-        raise HTTPException(502, f"Unexpected Gemini response: {json.dumps(data)[:300]}")
-
-    text = text.strip()
-    if text.startswith("```"):
-        text = text.strip("`")
-        if text.lower().startswith("json"):
-            text = text[4:]
-    text = text.strip()
+    if addressed_ai:
+        advisory_note = ("\n\nNOTE: the user is addressing you directly and specifically as a council "
+                          "member for a second opinion. Respond conversationally only — your reply cannot "
+                          "place or close trades in this mode, even if the schema below allows it, so leave "
+                          "trade_action and close_action null no matter what.")
+        chat_fn = {"groq": _call_groq_chat_raw, "deepseek": _call_deepseek_chat_raw, "gemini": _call_gemini_chat_raw}[addressed_ai]
+        try:
+            text = await chat_fn(system + advisory_note, history, message, timeout=60)
+        except Exception as e:
+            raise HTTPException(502, f"{addressed_ai.title()} call failed: {e}")
+    else:
+        text = await _call_llm_chat(system, history, message, timeout=60)
+    text = _clean_json_text(text)
 
     try:
         parsed = json.loads(text)
@@ -1281,7 +1506,7 @@ async def chat(payload: dict = Body(...)):
         settings["risk_notes"] = update["risk_notes"]
 
     reply = parsed.get("reply", "")
-    close_action = parsed.get("close_action")
+    close_action = parsed.get("close_action") if not addressed_ai else None
 
     if close_action and (close_action.get("all") or close_action.get("symbol")):
         target_symbol = (close_action.get("symbol") or "").upper().replace("/", "") or None
@@ -1312,7 +1537,7 @@ async def chat(payload: dict = Body(...)):
         else:
             reply += "\n\nNo matching open positions found to close."
 
-    trade_action = parsed.get("trade_action")
+    trade_action = parsed.get("trade_action") if not addressed_ai else None
 
     if close_action:
         trade_action = None  # never fake a close via an opposite trade_action
