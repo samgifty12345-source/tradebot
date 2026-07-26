@@ -126,7 +126,13 @@
       <p class="subtitle">Tell it to watch a different pair, switch timeframe, or set your risk rules — it updates the auto-trader live</p>
       <div id="chat-messages" class="chat-messages"></div>
       <div class="chat-input-row">
-        <input id="chat-input" placeholder="e.g. Watch EURUSD on H1 — or @deepseek what do you think about gold?" onkeydown="if(event.key==='Enter') sendChat()" />
+        <select id="chat-ai-select" class="chat-ai-select">
+          <option value="">Team (auto)</option>
+          <option value="gemini">Gemini</option>
+          <option value="groq">Groq</option>
+          <option value="deepseek">DeepSeek</option>
+        </select>
+        <input id="chat-input" placeholder="e.g. Watch EURUSD on H1, risk max 1% per trade" onkeydown="if(event.key==='Enter') sendChat()" />
         <button class="primary-btn chat-send-btn" onclick="sendChat()">Send</button>
       </div>
     </section>
