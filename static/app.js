@@ -153,10 +153,10 @@ function showDashboard() {
     document.getElementById(id).addEventListener("input", debounce(updateTradePreview, 400));
   });
   updateTradePreview();
-  setInterval(refreshAccount, 5000);
-  setInterval(refreshPositions, 5000);
-  setInterval(refreshAutotradeLog, 15000);
-  setInterval(refreshTradeLog, 15000);
+  setInterval(refreshAccount, 20000);
+  setInterval(refreshPositions, 20000);
+  setInterval(refreshAutotradeLog, 30000);
+  setInterval(refreshTradeLog, 30000);
 }
 
 function debounce(fn, wait) {
@@ -667,5 +667,5 @@ function changeTradeSymbol() {
 function startChart() {
   loadChartHistory();
   if (chartPollInterval) clearInterval(chartPollInterval);
-  chartPollInterval = setInterval(pollLatestCandle, 20000); // stay under free-tier rate limits
+  chartPollInterval = setInterval(pollLatestCandle, 60000); // stay under free-tier rate limits
 }
