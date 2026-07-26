@@ -1138,10 +1138,17 @@ Symbol should be a 6-letter forex/metal pair like XAUUSD, EURUSD, GBPUSD (no sla
 Respond with ONLY raw JSON (no markdown, no code fences), in exactly this shape:
 {{"reply": "your conversational reply to show the user",
   "settings_update": {{"symbol": string|null, "interval": string|null, "volume": number|null, "risk_notes": string|null}},
-  "trade_action": {{"side": "buy"|"sell", "symbol": string, "volume": number, "stop_loss": number|null, "take_profit": number|null}} | null}}
+  "trade_action": {{"side": "buy"|"sell", "symbol": string, "volume": number, "stop_loss": number|null, "take_profit": number|null}} | null,
+  "close_action": {{"symbol": string|null, "all": true|false}} | null}}
 
-trade_action must be null unless the user just explicitly asked you to place a trade right now.
+trade_action must be null unless the user just explicitly asked you to place a NEW trade right now.
 If they didn't mention a symbol/volume for the trade, use the current settings' symbol/volume.
+
+close_action is for CLOSING existing open positions (e.g. "close all trades", "close my gold position",
+"close everything"). NEVER use trade_action with an opposite side to "close" a position — that opens a
+brand new position instead of closing the existing one, and doubles the user's exposure. Use close_action
+instead: set "all": true to close every open position, or "symbol" to close only positions on that symbol.
+trade_action and close_action are mutually exclusive — only one may be non-null per response.
 """
 
 
@@ -1274,7 +1281,41 @@ async def chat(payload: dict = Body(...)):
         settings["risk_notes"] = update["risk_notes"]
 
     reply = parsed.get("reply", "")
+    close_action = parsed.get("close_action")
+
+    if close_action and (close_action.get("all") or close_action.get("symbol")):
+        target_symbol = (close_action.get("symbol") or "").upper().replace("/", "") or None
+        closed = []
+
+        for pos in list(sim_account["positions"]):
+            if target_symbol and pos["symbol"].upper() != target_symbol:
+                continue
+            result = await sim_close(pos["id"])
+            closed.append(f"{pos['symbol']} ({result.get('pnl')} P/L, demo)")
+
+        real_account_available = all([MT_LOGIN, MT_PASSWORD, MT_SERVER])
+        if real_account_available:
+            try:
+                _, conn = await _connect_account(MT_LOGIN, MT_PASSWORD, MT_SERVER, MT_PLATFORM)
+                real_positions = await conn.get_positions()
+                for pos in real_positions:
+                    if target_symbol and pos.get("symbol", "").upper() != target_symbol:
+                        continue
+                    await conn.close_position(pos["id"])
+                    _log_trade_close(pos["id"], (pos or {}).get("profit"))
+                    closed.append(f"{pos.get('symbol')} (real)")
+            except Exception:
+                pass
+
+        if closed:
+            reply += "\n\n✅ Closed: " + ", ".join(closed)
+        else:
+            reply += "\n\nNo matching open positions found to close."
+
     trade_action = parsed.get("trade_action")
+
+    if close_action:
+        trade_action = None  # never fake a close via an opposite trade_action
 
     if trade_action and trade_action.get("side") in ("buy", "sell"):
         trade_symbol = trade_action.get("symbol") or settings["symbol"]
