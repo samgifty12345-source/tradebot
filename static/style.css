@@ -17,6 +17,7 @@ body {
   color: var(--text);
   margin: 0;
   min-height: 100vh;
+  padding-bottom: 40px;
 }
 
 h1, h2 { margin: 0 0 12px 0; font-weight: 600; }
@@ -404,6 +405,34 @@ button {
 .tl-pending { color: var(--muted); font-size: 12px; }
 .profit { color: var(--green-buy); }
 .loss { color: var(--red); }
+
+.header-btn-group { display: flex; gap: 8px; align-items: center; }
+.ghost-btn {
+  width: auto; margin: 0; padding: 7px 14px; font-size: 12px;
+  background: transparent; color: var(--muted); border: 1px solid var(--border); border-radius: 8px; cursor: pointer;
+}
+.ghost-btn:hover { color: var(--red); border-color: rgba(239,70,85,0.4); }
+
+.position-row-clickable { cursor: pointer; transition: border-color 0.15s, background 0.15s; }
+.position-row-clickable:hover { border-color: var(--blue); background: #121826; }
+
+.ai-conversation-bar {
+  position: fixed;
+  bottom: 0; left: 0; right: 0;
+  background: #0a0d13;
+  border-top: 1px solid var(--border);
+  padding: 8px 16px;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  font-size: 12px;
+  color: var(--muted);
+  z-index: 50;
+  overflow: hidden;
+  white-space: nowrap;
+}
+.ai-convo-label { flex-shrink: 0; color: var(--blue); font-weight: 600; }
+.ai-convo-text { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 
 .tradelog-row-clickable { cursor: pointer; transition: border-color 0.15s, background 0.15s; }
 .tradelog-row-clickable:hover { border-color: var(--blue); background: #121826; }
