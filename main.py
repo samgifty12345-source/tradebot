@@ -677,6 +677,11 @@ async def _run_autotrade_sim():
         autotrade_status.update({"state": "idle", "note": f"Error: {str(e)[:120]}"})
 
 
+@app.get("/api/ai-conversation")
+async def get_ai_conversation():
+    return list(reversed(ai_conversation[-15:]))
+
+
 @app.get("/api/autotrade-status")
 async def get_autotrade_status():
     return autotrade_status
@@ -1064,7 +1069,20 @@ async def _fetch_multi_snapshot():
     return pairs_data
 
 
+# Live back-and-forth between Gemini and Groq during each scan — polled by the frontend
+# to show a small live conversation bar.
+ai_conversation = []
+
+
+def _log_conversation(speaker: str, text: str):
+    ai_conversation.append({"time": datetime.now(timezone.utc).isoformat(), "speaker": speaker, "text": text[:400]})
+    del ai_conversation[:-40]
+
+
 async def _ask_gemini_scan(pairs_data: dict, news_context: str = "not checked this run") -> dict:
+    """Gemini and Groq each independently analyze the same data, then a trade only
+    fires if they agree — otherwise it's held as a split decision. Their reasoning
+    is logged as a live conversation for the dashboard."""
     if not GEMINI_API_KEY and not GROQ_API_KEY:
         raise HTTPException(500, "Neither GEMINI_API_KEY nor GROQ_API_KEY is set on the server")
 
@@ -1075,12 +1093,56 @@ async def _ask_gemini_scan(pairs_data: dict, news_context: str = "not checked th
         pairs_json=json.dumps(pairs_data),
     )
 
-    text = await _call_llm_text(prompt, timeout=90)
-    text = _clean_json_text(text)
-    try:
-        return json.loads(text)
-    except json.JSONDecodeError:
-        raise HTTPException(502, f"LLM did not return valid JSON: {text[:300]}")
+    async def _try(name, fn):
+        try:
+            text = _clean_json_text(await fn(prompt, timeout=90))
+            return name, json.loads(text)
+        except Exception as e:
+            return name, None
+
+    results = dict(await asyncio.gather(_try("Gemini", _call_gemini_raw), _try("Groq", _call_groq_raw)))
+
+    for name, data in results.items():
+        if data:
+            action = data.get("action", "hold")
+            if action in ("buy", "sell"):
+                _log_conversation(name, f"I like {action.upper()} {data.get('best_symbol')} at {data.get('confidence', 0)}% — {data.get('reason', '')[:200]}")
+            else:
+                _log_conversation(name, f"Nothing worth taking right now. {data.get('reason', '')[:200]}")
+        else:
+            _log_conversation(name, "(no response this cycle)")
+
+    gemini_d, groq_d = results.get("Gemini"), results.get("Groq")
+
+    if gemini_d and not groq_d:
+        _log_conversation("Groq", "Didn't get a response from me — going with Gemini's read alone.")
+        return gemini_d
+    if groq_d and not gemini_d:
+        _log_conversation("Gemini", "Didn't get a response from me — going with Groq's read alone.")
+        return groq_d
+    if not gemini_d and not groq_d:
+        raise HTTPException(502, "Both Gemini and Groq failed to respond")
+
+    same_call = (
+        gemini_d.get("action") == groq_d.get("action")
+        and gemini_d.get("best_symbol") == groq_d.get("best_symbol")
+        and gemini_d.get("action") in ("buy", "sell")
+    )
+    if same_call:
+        merged = dict(gemini_d)
+        merged["confidence"] = min(gemini_d.get("confidence", 0), groq_d.get("confidence", 0))
+        merged["reason"] = f"Gemini: {gemini_d.get('reason', '')} | Groq agrees: {groq_d.get('reason', '')}"
+        merged["scanned"] = {**gemini_d.get("scanned", {}), **groq_d.get("scanned", {})}
+        _log_conversation("Council", f"We agree — {merged['action'].upper()} {merged['best_symbol']} at {merged['confidence']}% combined confidence.")
+        return merged
+
+    _log_conversation("Council", "We don't agree — holding this cycle.")
+    return {
+        "action": "hold", "best_symbol": None, "confidence": 0,
+        "reason": f"Gemini and Groq disagreed (Gemini: {gemini_d.get('action')} {gemini_d.get('best_symbol')}, Groq: {groq_d.get('action')} {groq_d.get('best_symbol')})",
+        "scanned": {**gemini_d.get("scanned", {}), **groq_d.get("scanned", {})},
+    }
+
 
 STRATEGY_PROMPT = """You are a disciplined ICT / Smart Money Concepts forex and gold trader.
 You will be given the most recent {n} candles for {symbol} on the {interval} timeframe,
@@ -1230,6 +1292,12 @@ async def get_autotrade_log():
     return list(reversed(autotrade_log))
 
 
+@app.delete("/api/autotrade/log")
+async def clear_autotrade_log():
+    autotrade_log.clear()
+    return {"status": "cleared"}
+
+
 GITHUB_TOKEN = os.getenv("GITHUB_TOKEN", "")
 GITHUB_REPO = os.getenv("GITHUB_REPO", "")  # e.g. "yourname/tradeweb"
 GITHUB_BRANCH = os.getenv("GITHUB_BRANCH", "main")
@@ -1266,6 +1334,31 @@ async def _github_save_state():
 
 
 chat_history = []  # list of {role, text} — persisted to GitHub
+
+
+AUTOTRADE_INTERVAL_SECONDS = int(os.getenv("AUTOTRADE_INTERVAL_SECONDS", "900"))  # 15 min
+HEARTBEAT_INTERVAL_SECONDS = int(os.getenv("HEARTBEAT_INTERVAL_SECONDS", "600"))  # 10 min
+
+
+async def _autotrade_scheduler_loop():
+    while True:
+        await asyncio.sleep(AUTOTRADE_INTERVAL_SECONDS)
+        try:
+            await _run_autotrade_sim()
+        except Exception as e:
+            print(f"[scheduler] autotrade cycle failed: {e}")
+
+
+async def _heartbeat_loop():
+    while True:
+        print(f"[heartbeat] app alive at {datetime.now(timezone.utc).isoformat()}")
+        await asyncio.sleep(HEARTBEAT_INTERVAL_SECONDS)
+
+
+@app.on_event("startup")
+async def _start_background_loops():
+    asyncio.create_task(_autotrade_scheduler_loop())
+    asyncio.create_task(_heartbeat_loop())
 
 
 @app.on_event("startup")
@@ -1322,6 +1415,12 @@ async def get_trades():
     """Unified trade log — every trade taken (manual, chat, or auto), real or
     demo, with entry/SL/TP/lot size/risk-reward/expected & actual P/L/confidence/reason."""
     return list(reversed(trade_log))
+
+
+@app.delete("/api/trades")
+async def clear_trades():
+    trade_log.clear()
+    return {"status": "cleared"}
 
 
 @app.get("/api/trade-preview")
