@@ -682,6 +682,17 @@ async def get_autotrade_status():
     return autotrade_status
 
 
+@app.post("/api/autotrade-run")
+async def autotrade_run(background_tasks: BackgroundTasks):
+    """Manual trigger for the 'Run Scan Now' button on the dashboard — same scan as the
+    cron-triggered /api/autotrade-sim, just without the secret since it's only reachable
+    from inside the dashboard itself."""
+    if autotrade_status.get("state") == "analyzing":
+        return {"status": "already_running", "note": "A scan is already in progress"}
+    background_tasks.add_task(_run_autotrade_sim)
+    return {"status": "started"}
+
+
 @app.get("/api/autotrade-sim")
 async def autotrade_sim(secret: str = Query(...), background_tasks: BackgroundTasks = None):
     """Same AI scan as the real autotrade loop, but trades the built-in demo
