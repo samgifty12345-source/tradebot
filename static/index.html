@@ -106,7 +106,10 @@
     </section>
 
     <section class="card autotrade-card">
-      <h2>AI Auto-Trade Log</h2>
+      <div class="card-header-row">
+        <h2>AI Auto-Trade Log</h2>
+        <button id="run-scan-btn" class="primary-btn" onclick="runScanNow()">Run Scan Now</button>
+      </div>
       <p class="subtitle">Runs automatically in the background every 15 min — this just shows what it decided</p>
       <div id="autotrade-status" class="autotrade-status-badge" style="display:none;"></div>
       <div id="autotrade-log" class="autotrade-list"></div>
