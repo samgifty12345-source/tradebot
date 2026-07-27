@@ -486,6 +486,13 @@ async function saveSettings() {
   }
 }
 
+async function resetSimAccount() {
+  if (!confirm("Reset demo balance to $5,000 and clear all open demo positions?")) return;
+  await fetch(`${API_BASE}/api/sim/reset`, { method: "POST" });
+  refreshAccount();
+  refreshPositions();
+}
+
 async function clearTradeLog() {
   if (!confirm("Clear the entire trade log? This can't be undone.")) return;
   await fetch(`${API_BASE}/api/trades`, { method: "DELETE" });
