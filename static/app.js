@@ -161,6 +161,18 @@ function showDashboard() {
   setInterval(refreshAutotradeStatus, 5000);
 }
 
+async function runScanNow() {
+  const btn = document.getElementById("run-scan-btn");
+  btn.disabled = true;
+  try {
+    const res = await fetch(`${API_BASE}/api/autotrade-run`, { method: "POST" });
+    await res.json();
+    refreshAutotradeStatus();
+  } catch (err) {
+    btn.disabled = false;
+  }
+}
+
 let lastAutotradeNote = null;
 
 async function refreshAutotradeStatus() {
@@ -169,6 +181,8 @@ async function refreshAutotradeStatus() {
     if (!res.ok) return;
     const status = await res.json();
     const el = document.getElementById("autotrade-status");
+    const btn = document.getElementById("run-scan-btn");
+    btn.disabled = status.state === "analyzing";
     if (status.state === "analyzing") {
       lastAutotradeNote = null;
       el.style.display = "flex";
