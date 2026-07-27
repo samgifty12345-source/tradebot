@@ -1096,11 +1096,13 @@ async def _ask_gemini_scan(pairs_data: dict, news_context: str = "not checked th
     async def _try(name, fn):
         try:
             text = _clean_json_text(await fn(prompt, timeout=90))
-            return name, json.loads(text)
+            return name, json.loads(text), None
         except Exception as e:
-            return name, None
+            return name, None, str(e)[:200]
 
-    results = dict(await asyncio.gather(_try("Gemini", _call_gemini_raw), _try("Groq", _call_groq_raw)))
+    outcomes = await asyncio.gather(_try("Gemini", _call_gemini_raw), _try("Groq", _call_groq_raw))
+    results = {name: data for name, data, _ in outcomes}
+    errors = {name: err for name, _, err in outcomes if err}
 
     for name, data in results.items():
         if data:
@@ -1110,18 +1112,18 @@ async def _ask_gemini_scan(pairs_data: dict, news_context: str = "not checked th
             else:
                 _log_conversation(name, f"Nothing worth taking right now. {data.get('reason', '')[:200]}")
         else:
-            _log_conversation(name, "(no response this cycle)")
+            _log_conversation(name, f"(failed: {errors.get(name, 'unknown error')})")
 
     gemini_d, groq_d = results.get("Gemini"), results.get("Groq")
 
     if gemini_d and not groq_d:
-        _log_conversation("Groq", "Didn't get a response from me — going with Gemini's read alone.")
+        _log_conversation("Groq", f"Didn't get a response from me ({errors.get('Groq', 'unknown error')}) — going with Gemini's read alone.")
         return gemini_d
     if groq_d and not gemini_d:
-        _log_conversation("Gemini", "Didn't get a response from me — going with Groq's read alone.")
+        _log_conversation("Gemini", f"Didn't get a response from me ({errors.get('Gemini', 'unknown error')}) — going with Groq's read alone.")
         return groq_d
     if not gemini_d and not groq_d:
-        raise HTTPException(502, "Both Gemini and Groq failed to respond")
+        raise HTTPException(502, f"Both Gemini and Groq failed — Gemini: {errors.get('Gemini')} | Groq: {errors.get('Groq')}")
 
     same_call = (
         gemini_d.get("action") == groq_d.get("action")
