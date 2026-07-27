@@ -568,10 +568,10 @@ async def _run_autotrade_sim():
             entry["closed_positions"] = closed
 
         if len(sim_account["positions"]) >= MAX_OPEN_POSITIONS:
-            entry.update({"status": "skipped", "reason": f"{len(sim_account['positions'])} open sim position(s)"})
+            entry.update({"status": "skipped", "reason": f"{len(sim_account['positions'])} open sim position(s), max is {MAX_OPEN_POSITIONS}"})
             autotrade_log.append(entry)
             del autotrade_log[:-50]
-            autotrade_status.update({"state": "idle", "note": "Skipped — max open positions"})
+            autotrade_status.update({"state": "idle", "note": f"Skipped — at max open positions ({MAX_OPEN_POSITIONS})"})
             return
 
         pairs_data = await _fetch_multi_snapshot()
@@ -585,14 +585,23 @@ async def _run_autotrade_sim():
         action = scan.get("action", "hold")
         best_symbol = scan.get("best_symbol")
         confidence = scan.get("confidence", 0)
+        open_count = len(sim_account["positions"])
+        already_holding_symbol = best_symbol and any(p["symbol"] == best_symbol for p in sim_account["positions"])
 
-        if action not in ("buy", "sell") or not best_symbol or confidence < MIN_CONFIDENCE:
-            entry.update({"status": "hold", "decision": scan})
+        stack_reason = None
+        if action in ("buy", "sell") and best_symbol and confidence >= MIN_CONFIDENCE:
+            if already_holding_symbol:
+                stack_reason = f"Already holding an open position on {best_symbol} — skipping duplicate"
+            elif open_count > 0 and confidence < STACK_MIN_CONFIDENCE:
+                stack_reason = f"{open_count} position(s) already open — need {STACK_MIN_CONFIDENCE}+ confidence to stack another, got {confidence}"
+
+        if action not in ("buy", "sell") or not best_symbol or confidence < MIN_CONFIDENCE or stack_reason:
+            entry.update({"status": "hold", "decision": scan, "hold_reason": stack_reason})
             autotrade_log.append(entry)
             del autotrade_log[:-50]
-            autotrade_status.update({"state": "idle", "note": "Hold — no setup met the confidence bar"})
+            autotrade_status.update({"state": "idle", "note": stack_reason or "Hold — no setup met the confidence bar"})
             opinion = await _ask_deepseek_opinion(
-                f"Decision: HOLD (no pair met the {MIN_CONFIDENCE}+ confidence threshold). "
+                f"Decision: HOLD ({stack_reason or f'no pair met the {MIN_CONFIDENCE}+ confidence threshold'}). "
                 f"Full scan: {json.dumps(scan)[:2000]}"
             )
             if opinion:
@@ -698,7 +707,8 @@ MT_PASSWORD = os.getenv("MT_PASSWORD", "")
 MT_SERVER = os.getenv("MT_SERVER", "")
 MT_PLATFORM = os.getenv("MT_PLATFORM", "mt5")
 TRADE_VOLUME_DEFAULT = float(os.getenv("TRADE_VOLUME", "0.01"))
-MAX_OPEN_POSITIONS = int(os.getenv("MAX_OPEN_POSITIONS", "1"))
+MAX_OPEN_POSITIONS = int(os.getenv("MAX_OPEN_POSITIONS", "3"))
+STACK_MIN_CONFIDENCE = int(os.getenv("STACK_MIN_CONFIDENCE", "80"))  # bar to add another trade while one's already open
 
 # Mutable at runtime via the chat panel — starts from env var defaults.
 # NOTE: resets to these defaults on every redeploy/restart (in-memory only).
