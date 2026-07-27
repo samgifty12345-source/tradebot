@@ -374,6 +374,14 @@ def _sim_pnl(position: dict, current_price: float) -> float:
     return _calc_pnl_dollars(position["symbol"], position["side"], position["entry_price"], current_price, position["volume"])
 
 
+@app.post("/api/sim/reset")
+async def reset_sim_account():
+    sim_account["balance"] = 5000.0
+    sim_account["positions"] = []
+    await _github_save_state()
+    return {"status": "reset", "balance": sim_account["balance"]}
+
+
 @app.get("/api/sim/account")
 async def sim_account_info():
     total_pnl = 0.0
