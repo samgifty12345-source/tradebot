@@ -159,6 +159,23 @@ function showDashboard() {
   setInterval(refreshTradeLog, 30000);
   refreshAutotradeStatus();
   setInterval(refreshAutotradeStatus, 5000);
+  refreshAiConversation();
+  setInterval(refreshAiConversation, 6000);
+}
+
+async function refreshAiConversation() {
+  try {
+    const res = await fetch(`${API_BASE}/api/ai-conversation`);
+    if (!res.ok) return;
+    const items = await res.json();
+    const bar = document.getElementById("ai-conversation-bar");
+    const textEl = document.getElementById("ai-convo-text");
+    if (!items.length) { bar.style.display = "none"; return; }
+    bar.style.display = "flex";
+    textEl.innerText = items.map((i) => `${i.speaker}: ${i.text}`).join("   •   ");
+  } catch (err) {
+    // silent
+  }
 }
 
 async function runScanNow() {
@@ -338,7 +355,9 @@ async function refreshPositions() {
   positions.forEach((p) => {
     const isProfit = p.profit >= 0;
     const row = document.createElement("div");
-    row.className = "position-row";
+    row.className = "position-row position-row-clickable";
+    row.title = `Click to view ${p.symbol} on the chart`;
+    row.onclick = (e) => { if (e.target.tagName !== "BUTTON") openTradeInChart(p.symbol); };
     row.innerHTML = `
       <div>
         <strong>${p.symbol}</strong>
@@ -467,7 +486,17 @@ async function saveSettings() {
   }
 }
 
-// ---------- Trade log ----------
+async function clearTradeLog() {
+  if (!confirm("Clear the entire trade log? This can't be undone.")) return;
+  await fetch(`${API_BASE}/api/trades`, { method: "DELETE" });
+  refreshTradeLog();
+}
+
+async function clearAutotradeLog() {
+  if (!confirm("Clear the entire auto-trade log? This can't be undone.")) return;
+  await fetch(`${API_BASE}/api/autotrade/log`, { method: "DELETE" });
+  refreshAutotradeLog();
+}
 
 function openTradeInChart(symbol) {
   document.getElementById("chart-symbol").value = symbol;
@@ -674,6 +703,7 @@ async function loadChartHistory() {
       low: c.low,
       close: c.close,
     }));
+    candleSeries.priceScale().applyOptions({ autoScale: true });
     candleSeries.setData(formatted);
     candleSeries.setMarkers(computeBoundaryMarkers(formatted, currentInterval));
     chart.timeScale().fitContent();
