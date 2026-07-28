@@ -297,8 +297,8 @@ PROFIT_TARGET_USD = float(os.getenv("PROFIT_TARGET_USD", "300"))
 # Hard $ auto-close thresholds — checked every cycle for BOTH the real and demo
 # accounts, independent of the AI momentum-management above. No AI judgment call
 # here: the instant floating P/L crosses either line, the position is closed.
-HARD_PROFIT_CLOSE_USD = float(os.getenv("HARD_PROFIT_CLOSE_USD", "100"))
-HARD_LOSS_CLOSE_USD = float(os.getenv("HARD_LOSS_CLOSE_USD", "50"))
+HARD_PROFIT_CLOSE_USD = float(os.getenv("HARD_PROFIT_CLOSE_USD", "70"))
+HARD_LOSS_CLOSE_USD = float(os.getenv("HARD_LOSS_CLOSE_USD", "35"))
 
 # Rough per-instrument contract sizing — approximate, NOT exact broker specs.
 # This is for realistic-feeling testing, not precise accounting.
