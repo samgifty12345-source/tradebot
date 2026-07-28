@@ -7,7 +7,7 @@ from datetime import datetime, timezone
 from typing import Dict
 
 import httpx
-from fastapi import FastAPI, HTTPException, Body, Query, BackgroundTasks
+from fastapi import FastAPI, HTTPException, Body, Query, BackgroundTasks, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse
@@ -706,6 +706,15 @@ async def autotrade_run(background_tasks: BackgroundTasks):
     return {"status": "started"}
 
 
+@app.head("/api/autotrade-sim")
+async def autotrade_sim_head(secret: str = Query(...)):
+    """Uptime monitors (e.g. UptimeRobot) send HEAD requests before/instead of GET —
+    this just validates without triggering a scan, so monitoring doesn't 405."""
+    if not AUTOTRADE_SECRET or secret != AUTOTRADE_SECRET:
+        raise HTTPException(403, "Invalid secret")
+    return Response(status_code=200)
+
+
 @app.get("/api/autotrade-sim")
 async def autotrade_sim(secret: str = Query(...), background_tasks: BackgroundTasks = None):
     """Same AI scan as the real autotrade loop, but trades the built-in demo
@@ -722,7 +731,7 @@ async def autotrade_sim(secret: str = Query(...), background_tasks: BackgroundTa
 
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
 GROQ_API_KEY = os.getenv("GROQ_API_KEY", "")
-GROQ_MODEL = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
+GROQ_MODEL = os.getenv("GROQ_MODEL", "llama-3.1-8b-instant")
 DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY", "")
 DEEPSEEK_MODEL = os.getenv("DEEPSEEK_MODEL", "deepseek-chat")
 AUTOTRADE_SECRET = os.getenv("AUTOTRADE_SECRET", "")
