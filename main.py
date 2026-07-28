@@ -520,6 +520,22 @@ def _market_status():
 
 
 _daily_run_count = {"date": None, "count": 0}
+_daily_gemini_calls = {"date": None, "count": 0}
+GEMINI_DAILY_SCAN_BUDGET = int(os.getenv("GEMINI_DAILY_SCAN_BUDGET", "12"))  # free tier RPD is 20 — leave headroom for chat
+
+
+def _gemini_scan_budget_available() -> bool:
+    """Tracks Gemini calls made by the automated scan loop only (not chat), so the
+    automated 15-min cycle doesn't burn through the whole daily quota by itself."""
+    today = datetime.now(timezone.utc).date().isoformat()
+    if _daily_gemini_calls["date"] != today:
+        _daily_gemini_calls["date"] = today
+        _daily_gemini_calls["count"] = 0
+    return _daily_gemini_calls["count"] < GEMINI_DAILY_SCAN_BUDGET
+
+
+def _bump_gemini_scan_count():
+    _daily_gemini_calls["count"] += 1
 
 
 def _bump_daily_run_count():
@@ -1117,7 +1133,14 @@ async def _ask_gemini_scan(pairs_data: dict, news_context: str = "not checked th
         except Exception as e:
             return name, None, str(e)[:200]
 
-    outcomes = await asyncio.gather(_try("Gemini", _call_gemini_raw), _try("Groq", _call_groq_raw))
+    tasks = [_try("Groq", _call_groq_raw)]
+    if _gemini_scan_budget_available():
+        _bump_gemini_scan_count()
+        tasks.append(_try("Gemini", _call_gemini_raw))
+    else:
+        _log_conversation("Gemini", f"Sitting this one out — daily auto-scan budget ({GEMINI_DAILY_SCAN_BUDGET}) spent, saving quota for chat.")
+
+    outcomes = await asyncio.gather(*tasks)
     results = {name: data for name, data, _ in outcomes}
     errors = {name: err for name, _, err in outcomes if err}
 
