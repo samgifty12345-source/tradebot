@@ -210,6 +210,17 @@ button {
   border-radius: 8px;
   padding: 10px 14px;
 }
+.autotrade-row-clickable { cursor: pointer; transition: border-color 0.15s; }
+.autotrade-row-clickable:hover { border-color: var(--blue); }
+.at-detail {
+  margin-top: 10px;
+  padding-top: 10px;
+  border-top: 1px solid var(--border);
+  font-size: 12px;
+  color: var(--muted);
+}
+.at-detail-row { margin-bottom: 6px; line-height: 1.5; }
+.at-detail-row strong { color: var(--text); }
 .at-top { display: flex; align-items: center; justify-content: space-between; }
 .at-badge {
   font-size: 11px;
