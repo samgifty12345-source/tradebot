@@ -151,9 +151,21 @@
   </div>
 </div>
 
-<div id="ai-conversation-bar" class="ai-conversation-bar" style="display:none;">
+<div id="ai-conversation-bar" class="ai-conversation-bar" style="display:none;" onclick="openCouncilModal()">
   <span class="ai-convo-label">Council chat:</span>
   <span id="ai-convo-text" class="ai-convo-text"></span>
+  <span class="ai-convo-expand">Tap for full discussion &rsaquo;</span>
+</div>
+
+<div id="council-overlay" class="settings-overlay" style="display:none;" onclick="if(event.target===this) closeCouncilModal()">
+  <div class="settings-panel council-panel">
+    <div class="card-header-row">
+      <h2>Council Discussion</h2>
+      <button class="icon-btn" onclick="closeCouncilModal()">&times;</button>
+    </div>
+    <p class="subtitle">Gemini and Groq scan independently every cycle; DeepSeek reviews before a trade is allowed to fire. Newest first, live while open.</p>
+    <div id="council-feed" class="council-feed"></div>
+  </div>
 </div>
 
 <script src="https://cdn.jsdelivr.net/npm/lightweight-charts@4.1.3/dist/lightweight-charts.standalone.production.js"></script>
