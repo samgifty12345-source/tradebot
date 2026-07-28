@@ -294,6 +294,12 @@ def _log_trade_close(position_id: str, actual_pnl):
 MAX_LOSS_USD = float(os.getenv("MAX_LOSS_USD", "300"))
 PROFIT_TARGET_USD = float(os.getenv("PROFIT_TARGET_USD", "300"))
 
+# Hard $ auto-close thresholds — checked every cycle for BOTH the real and demo
+# accounts, independent of the AI momentum-management above. No AI judgment call
+# here: the instant floating P/L crosses either line, the position is closed.
+HARD_PROFIT_CLOSE_USD = float(os.getenv("HARD_PROFIT_CLOSE_USD", "100"))
+HARD_LOSS_CLOSE_USD = float(os.getenv("HARD_LOSS_CLOSE_USD", "50"))
+
 # Rough per-instrument contract sizing — approximate, NOT exact broker specs.
 # This is for realistic-feeling testing, not precise accounting.
 CONTRACT_SIZE = {"XAUUSD": 100, "BTCUSD": 1, "ETHUSD": 1}
@@ -488,6 +494,15 @@ async def _manage_sim_positions():
         hit_tp = pos.get("tp") is not None and (
             (pos["side"] == "buy" and price >= pos["tp"]) or (pos["side"] == "sell" and price <= pos["tp"])
         )
+        hit_hard_profit = pnl >= HARD_PROFIT_CLOSE_USD
+        hit_hard_loss = pnl <= -HARD_LOSS_CLOSE_USD
+
+        if hit_hard_profit or hit_hard_loss:
+            reason = f"Hit hard profit close (${pnl:.2f} >= ${HARD_PROFIT_CLOSE_USD})" if hit_hard_profit else \
+                     f"Hit hard stop loss close (${pnl:.2f} <= -${HARD_LOSS_CLOSE_USD})"
+            result = await sim_close(pos["id"])
+            closed.append({"symbol": pos["symbol"], "reason": reason, "pnl": result["pnl"]})
+            continue
 
         if hit_sl or hit_tp or pnl <= -MAX_LOSS_USD or pnl >= PROFIT_TARGET_USD:
             reason = ("Hit stop loss price level" if hit_sl else
@@ -505,6 +520,42 @@ async def _manage_sim_positions():
                 closed.append({"symbol": pos["symbol"], "reason": decision.get("reason", "AI judged momentum was fading"), "pnl": result["pnl"]})
         except Exception:
             pass  # leave position open if the check itself fails
+
+    return closed
+
+
+async def _manage_real_positions():
+    """Hard $ profit/loss auto-close for the REAL MetaApi account. Runs every
+    background cycle regardless of whether a new-trade scan happens, so a live
+    position never sits past +$HARD_PROFIT_CLOSE_USD or -$HARD_LOSS_CLOSE_USD."""
+    closed = []
+    if not all([MT_LOGIN, MT_PASSWORD, MT_SERVER]):
+        return closed
+
+    try:
+        _, conn = await _connect_account(MT_LOGIN, MT_PASSWORD, MT_SERVER, MT_PLATFORM)
+        positions = await conn.get_positions()
+    except Exception:
+        return closed  # connection/fetch failed — leave positions alone, try again next cycle
+
+    for pos in positions:
+        pnl = pos.get("profit")
+        if pnl is None:
+            continue
+
+        hit_hard_profit = pnl >= HARD_PROFIT_CLOSE_USD
+        hit_hard_loss = pnl <= -HARD_LOSS_CLOSE_USD
+        if not (hit_hard_profit or hit_hard_loss):
+            continue
+
+        reason = f"Hit hard profit close (${pnl:.2f} >= ${HARD_PROFIT_CLOSE_USD})" if hit_hard_profit else \
+                 f"Hit hard stop loss close (${pnl:.2f} <= -${HARD_LOSS_CLOSE_USD})"
+        try:
+            await conn.close_position(pos["id"])
+            _log_trade_close(pos["id"], pnl)
+            closed.append({"symbol": pos.get("symbol"), "reason": reason, "pnl": pnl})
+        except Exception:
+            pass  # leave it open if the close call itself fails — retried next cycle
 
     return closed
 
@@ -1329,6 +1380,10 @@ async def _run_autotrade():
     try:
         account_id, conn = await _connect_account(MT_LOGIN, MT_PASSWORD, MT_SERVER, MT_PLATFORM)
 
+        closed = await _manage_real_positions()
+        if closed:
+            entry["closed"] = closed
+
         positions = await conn.get_positions()
         if len(positions) >= MAX_OPEN_POSITIONS:
             entry.update({"status": "skipped", "reason": f"{len(positions)} open position(s), max is {MAX_OPEN_POSITIONS}"})
@@ -1444,6 +1499,10 @@ HEARTBEAT_INTERVAL_SECONDS = int(os.getenv("HEARTBEAT_INTERVAL_SECONDS", "600"))
 async def _autotrade_scheduler_loop():
     while True:
         await asyncio.sleep(AUTOTRADE_INTERVAL_SECONDS)
+        try:
+            await _manage_real_positions()
+        except Exception as e:
+            print(f"[scheduler] real position management failed: {e}")
         try:
             await _run_autotrade_sim()
         except Exception as e:
