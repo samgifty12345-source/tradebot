@@ -117,11 +117,28 @@ async def get_price(account_id: str, symbol: str):
 async def _place_trade(conn, symbol: str, side: str, volume: float, sl=None, tp=None,
                         confidence=None, reason: str = "", source: str = "manual", account: str = "real"):
     volume = _enforce_min_lot(symbol, volume)
+
+    # Estimate entry price up front so a real broker-side SL/TP can be attached
+    # at order time — this makes the $ profit/loss cap the BROKER's job, closing
+    # the position instantly, instead of depending on the bot polling afterward.
+    entry_estimate = None
+    try:
+        price_info = await conn.get_symbol_price(symbol)
+        entry_estimate = price_info.get("ask") if side == "buy" else price_info.get("bid")
+    except Exception:
+        pass
+
+    final_sl = float(sl) if sl else None
+    final_tp = float(tp) if tp else None
+    if entry_estimate and account == "real":
+        final_sl = _price_for_usd_pnl(symbol, side, entry_estimate, volume, -HARD_LOSS_CLOSE_USD)
+        final_tp = _price_for_usd_pnl(symbol, side, entry_estimate, volume, HARD_PROFIT_CLOSE_USD)
+
     opts = {}
-    if sl:
-        opts["stop_loss"] = float(sl)
-    if tp:
-        opts["take_profit"] = float(tp)
+    if final_sl:
+        opts["stop_loss"] = float(final_sl)
+    if final_tp:
+        opts["take_profit"] = float(final_tp)
 
     if side == "buy":
         result = await conn.create_market_buy_order(symbol, float(volume), **opts)
@@ -131,7 +148,7 @@ async def _place_trade(conn, symbol: str, side: str, volume: float, sl=None, tp=
         raise HTTPException(400, "side must be 'buy' or 'sell'")
 
     position_id = (result or {}).get("positionId") or (result or {}).get("orderId") or uuid.uuid4().hex[:10]
-    entry_price = (result or {}).get("price")
+    entry_price = (result or {}).get("price") or entry_estimate
     if entry_price is None:
         try:
             price_info = await conn.get_symbol_price(symbol)
@@ -139,10 +156,13 @@ async def _place_trade(conn, symbol: str, side: str, volume: float, sl=None, tp=
         except Exception:
             entry_price = None
 
+    if account == "real":
+        _tracked_real_positions[position_id] = {"symbol": symbol, "side": side, "sl": final_sl, "tp": final_tp}
+
     if entry_price is not None:
         _log_trade_open(
             position_id=position_id, symbol=symbol, side=side, volume=volume, entry=entry_price,
-            sl=float(sl) if sl else None, tp=float(tp) if tp else None,
+            sl=final_sl, tp=final_tp,
             confidence=confidence, reason=reason, source=source, account=account,
         )
     return result
@@ -294,11 +314,77 @@ def _log_trade_close(position_id: str, actual_pnl):
 MAX_LOSS_USD = float(os.getenv("MAX_LOSS_USD", "300"))
 PROFIT_TARGET_USD = float(os.getenv("PROFIT_TARGET_USD", "300"))
 
-# Hard $ auto-close thresholds — checked every cycle for BOTH the real and demo
-# accounts, independent of the AI momentum-management above. No AI judgment call
-# here: the instant floating P/L crosses either line, the position is closed.
-HARD_PROFIT_CLOSE_USD = float(os.getenv("HARD_PROFIT_CLOSE_USD", "70"))
-HARD_LOSS_CLOSE_USD = float(os.getenv("HARD_LOSS_CLOSE_USD", "35"))
+# Hard $ auto-close thresholds — enforced for BOTH the real and demo accounts,
+# independent of the AI momentum-management above. No AI judgment call here:
+# the instant floating P/L crosses either line, the position is closed. For the
+# REAL account this is attached as an actual broker-side SL/TP order at trade
+# open time (see _place_trade / _price_for_usd_pnl below), so it fires instantly
+# without needing the bot to poll and notice.
+HARD_PROFIT_CLOSE_USD = float(os.getenv("HARD_PROFIT_CLOSE_USD", "100"))
+HARD_LOSS_CLOSE_USD = float(os.getenv("HARD_LOSS_CLOSE_USD", "50"))
+
+# Daily win/loss streak control. Hitting either limit doesn't stop the bot for
+# good — it switches into a slower, choosier, smaller-size "cautious mode" for
+# the rest of the UTC day: longer gap between checks, much higher confidence
+# bar required to open a new trade, and a much smaller lot size.
+DAILY_WIN_LIMIT = int(os.getenv("DAILY_WIN_LIMIT", "2"))
+DAILY_LOSS_LIMIT = int(os.getenv("DAILY_LOSS_LIMIT", "3"))
+CAUTIOUS_INTERVAL_SECONDS = int(os.getenv("CAUTIOUS_INTERVAL_SECONDS", "3600"))  # 1 hour
+CAUTIOUS_MIN_CONFIDENCE = float(os.getenv("CAUTIOUS_MIN_CONFIDENCE", "90"))
+CAUTIOUS_LOT_SCALE = float(os.getenv("CAUTIOUS_LOT_SCALE", "0.3"))  # 30% of the normal lot size
+
+_daily_trade_state = {"date": None, "wins": 0, "losses": 0, "mode": "normal"}
+
+# id -> {symbol, side, sl, tp} for real positions opened with a hard-cap broker
+# SL/TP, so _manage_real_positions can tell whether a position that vanished
+# between polls was closed by hitting the profit side or the loss side.
+_tracked_real_positions: Dict[str, dict] = {}
+
+
+def _reset_daily_trade_state_if_needed():
+    today = datetime.now(timezone.utc).date().isoformat()
+    if _daily_trade_state["date"] != today:
+        _daily_trade_state.update({"date": today, "wins": 0, "losses": 0, "mode": "normal"})
+
+
+def _record_hard_close(is_win: bool):
+    """Call whenever the hard $ rule closes a position (real or demo). Tracks the
+    day's wins/losses and flips into cautious mode once either daily limit hits."""
+    _reset_daily_trade_state_if_needed()
+    if is_win:
+        _daily_trade_state["wins"] += 1
+    else:
+        _daily_trade_state["losses"] += 1
+    if _daily_trade_state["wins"] >= DAILY_WIN_LIMIT or _daily_trade_state["losses"] >= DAILY_LOSS_LIMIT:
+        _daily_trade_state["mode"] = "cautious"
+
+
+def _current_min_confidence() -> float:
+    _reset_daily_trade_state_if_needed()
+    return CAUTIOUS_MIN_CONFIDENCE if _daily_trade_state["mode"] == "cautious" else MIN_CONFIDENCE
+
+
+def _current_lot_scale() -> float:
+    _reset_daily_trade_state_if_needed()
+    return CAUTIOUS_LOT_SCALE if _daily_trade_state["mode"] == "cautious" else 1.0
+
+
+def _current_scan_interval() -> int:
+    _reset_daily_trade_state_if_needed()
+    return CAUTIOUS_INTERVAL_SECONDS if _daily_trade_state["mode"] == "cautious" else AUTOTRADE_INTERVAL_SECONDS
+
+
+def _price_for_usd_pnl(symbol: str, side: str, entry_price: float, volume: float, pnl_usd: float) -> float:
+    """Inverse of _calc_pnl_dollars: the exit price that yields exactly $pnl_usd
+    of P/L for this side/volume starting from entry_price. Used to translate the
+    hard $ profit/loss caps into an actual broker-side SL/TP price."""
+    contract = CONTRACT_SIZE.get(symbol, DEFAULT_CONTRACT_SIZE)
+    divisor = 1 if symbol in CONTRACT_SIZE else 10000
+    direction = 1 if side == "buy" else -1
+    if volume <= 0 or contract <= 0:
+        return entry_price
+    delta = pnl_usd * divisor / (volume * contract)
+    return entry_price + delta * direction
 
 # Rough per-instrument contract sizing — approximate, NOT exact broker specs.
 # This is for realistic-feeling testing, not precise accounting.
@@ -501,6 +587,7 @@ async def _manage_sim_positions():
             reason = f"Hit hard profit close (${pnl:.2f} >= ${HARD_PROFIT_CLOSE_USD})" if hit_hard_profit else \
                      f"Hit hard stop loss close (${pnl:.2f} <= -${HARD_LOSS_CLOSE_USD})"
             result = await sim_close(pos["id"])
+            _record_hard_close(hit_hard_profit)
             closed.append({"symbol": pos["symbol"], "reason": reason, "pnl": result["pnl"]})
             continue
 
@@ -525,9 +612,12 @@ async def _manage_sim_positions():
 
 
 async def _manage_real_positions():
-    """Hard $ profit/loss auto-close for the REAL MetaApi account. Runs every
-    background cycle regardless of whether a new-trade scan happens, so a live
-    position never sits past +$HARD_PROFIT_CLOSE_USD or -$HARD_LOSS_CLOSE_USD."""
+    """Safety-net + tracking for the REAL MetaApi account. The hard $ profit/loss
+    cap is normally enforced instantly by the broker-side SL/TP order attached
+    when the trade was opened (see _place_trade) — this function (a) catches any
+    position the broker didn't close for some reason (e.g. it rejected the exact
+    SL/TP distance), and (b) notices positions the broker already closed on its
+    own so the daily win/loss streak counters stay accurate."""
     closed = []
     if not all([MT_LOGIN, MT_PASSWORD, MT_SERVER]):
         return closed
@@ -537,6 +627,25 @@ async def _manage_real_positions():
         positions = await conn.get_positions()
     except Exception:
         return closed  # connection/fetch failed — leave positions alone, try again next cycle
+
+    open_ids = {pos["id"] for pos in positions}
+
+    # Anything we were tracking that's no longer open was closed by the broker's
+    # own SL/TP order already. Figure out win vs. loss from which target the last
+    # known price sat closer to, and count it toward today's streak.
+    for tracked_id in list(_tracked_real_positions.keys()):
+        if tracked_id in open_ids:
+            continue
+        info = _tracked_real_positions.pop(tracked_id)
+        try:
+            price = await _get_price(info["symbol"])
+            dist_to_tp = abs(price - info["tp"]) if info.get("tp") else None
+            dist_to_sl = abs(price - info["sl"]) if info.get("sl") else None
+            is_win = dist_to_tp is not None and (dist_to_sl is None or dist_to_tp <= dist_to_sl)
+        except Exception:
+            is_win = True  # can't tell — doesn't change which streak limit blocks trading
+        _record_hard_close(is_win)
+        closed.append({"symbol": info["symbol"], "reason": "Closed by broker SL/TP (hard cap)", "pnl": None})
 
     for pos in positions:
         pnl = pos.get("profit")
@@ -553,6 +662,8 @@ async def _manage_real_positions():
         try:
             await conn.close_position(pos["id"])
             _log_trade_close(pos["id"], pnl)
+            _record_hard_close(hit_hard_profit)
+            _tracked_real_positions.pop(pos["id"], None)
             closed.append({"symbol": pos.get("symbol"), "reason": reason, "pnl": pnl})
         except Exception:
             pass  # leave it open if the close call itself fails — retried next cycle
@@ -692,20 +803,21 @@ async def _run_autotrade_sim():
         open_count = len(sim_account["positions"])
         already_holding_symbol = best_symbol and any(p["symbol"] == best_symbol for p in sim_account["positions"])
 
+        min_confidence = _current_min_confidence()
         stack_reason = None
-        if action in ("buy", "sell") and best_symbol and confidence >= MIN_CONFIDENCE:
+        if action in ("buy", "sell") and best_symbol and confidence >= min_confidence:
             if already_holding_symbol:
                 stack_reason = f"Already holding an open position on {best_symbol} — skipping duplicate"
             elif open_count > 0 and confidence < STACK_MIN_CONFIDENCE:
                 stack_reason = f"{open_count} position(s) already open — need {STACK_MIN_CONFIDENCE}+ confidence to stack another, got {confidence}"
 
-        if action not in ("buy", "sell") or not best_symbol or confidence < MIN_CONFIDENCE or stack_reason:
+        if action not in ("buy", "sell") or not best_symbol or confidence < min_confidence or stack_reason:
             entry.update({"status": "hold", "decision": scan, "hold_reason": stack_reason})
             autotrade_log.append(entry)
             del autotrade_log[:-50]
             autotrade_status.update({"state": "idle", "note": stack_reason or "Hold — no setup met the confidence bar"})
             opinion = await _ask_deepseek_opinion(
-                f"Decision: HOLD ({stack_reason or f'no pair met the {MIN_CONFIDENCE}+ confidence threshold'}). "
+                f"Decision: HOLD ({stack_reason or f'no pair met the {min_confidence}+ confidence threshold'}). "
                 f"Full scan: {json.dumps(scan)[:2000]}"
             )
             if opinion:
@@ -753,6 +865,7 @@ async def _run_autotrade_sim():
             return
 
         volume = _smart_volume(best_symbol, confidence, entry_price=price_now, sl=scan.get("stop_loss"))
+        volume = _enforce_min_lot(best_symbol, round(volume * _current_lot_scale(), 2))
         pos = await sim_trade({
             "symbol": best_symbol, "side": action, "volume": volume,
             "sl": scan.get("stop_loss"), "tp": scan.get("take_profit"),
@@ -1400,8 +1513,9 @@ async def _run_autotrade():
         action = scan.get("action", "hold")
         best_symbol = scan.get("best_symbol")
         confidence = scan.get("confidence", 0)
+        min_confidence = _current_min_confidence()
 
-        if action not in ("buy", "sell") or not best_symbol or confidence < MIN_CONFIDENCE:
+        if action not in ("buy", "sell") or not best_symbol or confidence < min_confidence:
             entry.update({"status": "hold", "decision": scan})
             autotrade_log.append(entry)
             del autotrade_log[:-50]
@@ -1414,6 +1528,7 @@ async def _run_autotrade():
         except Exception:
             pass
         volume = _smart_volume(best_symbol, confidence, entry_price=entry_price_est, sl=scan.get("stop_loss"))
+        volume = _enforce_min_lot(best_symbol, round(volume * _current_lot_scale(), 2))
 
         result = await _place_trade(
             conn, best_symbol, action, volume,
@@ -1498,7 +1613,7 @@ HEARTBEAT_INTERVAL_SECONDS = int(os.getenv("HEARTBEAT_INTERVAL_SECONDS", "600"))
 
 async def _autotrade_scheduler_loop():
     while True:
-        await asyncio.sleep(AUTOTRADE_INTERVAL_SECONDS)
+        await asyncio.sleep(_current_scan_interval())
         try:
             await _manage_real_positions()
         except Exception as e:
