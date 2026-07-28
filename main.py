@@ -475,16 +475,26 @@ async def _ask_manage_gemini(pos: dict, candles: list, pnl: float) -> dict:
 
 async def _manage_sim_positions():
     """Runs every autotrade-sim cycle before scanning for new trades. Closes
-    positions that hit the $ stop/target, or that the AI judges to be losing
-    momentum even before hitting those hard limits."""
+    positions that hit their actual SL/TP price level, the $ stop/target, or
+    that the AI judges to be losing momentum even before hitting those limits."""
     closed = []
     for pos in list(sim_account["positions"]):
         price = await _get_price(pos["symbol"])
         pnl = _sim_pnl(pos, price)
 
-        if pnl <= -MAX_LOSS_USD or pnl >= PROFIT_TARGET_USD:
+        hit_sl = pos.get("sl") is not None and (
+            (pos["side"] == "buy" and price <= pos["sl"]) or (pos["side"] == "sell" and price >= pos["sl"])
+        )
+        hit_tp = pos.get("tp") is not None and (
+            (pos["side"] == "buy" and price >= pos["tp"]) or (pos["side"] == "sell" and price <= pos["tp"])
+        )
+
+        if hit_sl or hit_tp or pnl <= -MAX_LOSS_USD or pnl >= PROFIT_TARGET_USD:
+            reason = ("Hit stop loss price level" if hit_sl else
+                      "Hit take profit price level" if hit_tp else
+                      f"Hit {'stop loss' if pnl < 0 else 'profit target'} (${pnl:.2f})")
             result = await sim_close(pos["id"])
-            closed.append({"symbol": pos["symbol"], "reason": f"Hit {'stop loss' if pnl < 0 else 'profit target'} (${pnl:.2f})", "pnl": result["pnl"]})
+            closed.append({"symbol": pos["symbol"], "reason": reason, "pnl": result["pnl"]})
             continue
 
         try:
@@ -577,6 +587,10 @@ def _confidence_volume(base_volume: float, confidence: float) -> float:
     return round(base_volume * scale, 2)
 
 
+MANAGE_CHECK_INTERVAL_WHEN_MAXED = int(os.getenv("MANAGE_CHECK_INTERVAL_WHEN_MAXED", "3600"))  # 1 hour
+_last_maxed_check = {"time": None}
+
+
 async def _run_autotrade_sim():
     autotrade_status.update({"state": "analyzing", "since": datetime.now(timezone.utc).isoformat(), "note": "Scanning watchlist..."})
     entry = {"time": datetime.now(timezone.utc).isoformat()}
@@ -587,15 +601,30 @@ async def _run_autotrade_sim():
         entry["news_check"] = await _fetch_forex_news()
 
     try:
+        at_max = len(sim_account["positions"]) >= MAX_OPEN_POSITIONS
+
+        if at_max:
+            now_ts = datetime.now(timezone.utc).timestamp()
+            last = _last_maxed_check["time"]
+            if last is not None and now_ts - last < MANAGE_CHECK_INTERVAL_WHEN_MAXED:
+                remaining_min = int((MANAGE_CHECK_INTERVAL_WHEN_MAXED - (now_ts - last)) / 60)
+                entry.update({"status": "skipped", "reason": f"At max positions — next safety check in ~{remaining_min} min"})
+                autotrade_log.append(entry)
+                del autotrade_log[:-50]
+                autotrade_status.update({"state": "idle", "note": f"At max positions — next check in ~{remaining_min} min"})
+                return
+            _last_maxed_check["time"] = now_ts
+
         closed = await _manage_sim_positions()
         if closed:
             entry["closed_positions"] = closed
 
-        if len(sim_account["positions"]) >= MAX_OPEN_POSITIONS:
-            entry.update({"status": "skipped", "reason": f"{len(sim_account['positions'])} open sim position(s), max is {MAX_OPEN_POSITIONS}"})
+        if at_max:
+            still_open = len(sim_account["positions"])
+            entry.update({"status": "skipped", "reason": f"{still_open} open sim position(s), max is {MAX_OPEN_POSITIONS} — checked safety, no new entries"})
             autotrade_log.append(entry)
             del autotrade_log[:-50]
-            autotrade_status.update({"state": "idle", "note": f"Skipped — at max open positions ({MAX_OPEN_POSITIONS})"})
+            autotrade_status.update({"state": "idle", "note": f"Safety check done — at max open positions ({MAX_OPEN_POSITIONS})"})
             return
 
         pairs_data = await _fetch_multi_snapshot()
