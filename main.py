@@ -994,9 +994,10 @@ async def _ask_deepseek_opinion(context: str) -> str | None:
 SCAN_PROMPT = """You are a disciplined ICT / Smart Money Concepts trader scanning multiple pairs
 to find the single best trade opportunity right now.
 
-For each pair below you're given, per timeframe: candles (oldest first, as {{time, open, high, low, close}}),
-plus sma20, sma50 (simple moving averages) and rsi14 (14-period RSI) already calculated for you — use these
-alongside your own reading of the candles rather than re-deriving them.
+For each pair below you're given, per timeframe: "c" = candles oldest-first as [open, high, low, close]
+arrays (most recent {candles_per_tf} only), plus sma20, sma50 (simple moving averages) and rsi14
+(14-period RSI) already calculated for you — use these alongside your own reading of the candles
+rather than re-deriving them.
 
 For EACH pair, analyze for: liquidity sweeps, break of structure (BOS), change of character (CHoCH),
 fair value gaps (FVG), order blocks, and notable candle patterns (doji, engulfing, pin bars).
@@ -1112,6 +1113,27 @@ def _log_conversation(speaker: str, text: str):
     del ai_conversation[:-40]
 
 
+def _compact_for_prompt(pairs_data: dict, candles_per_tf: int = 12) -> dict:
+    """The full snapshot (6 pairs x 4 timeframes x 30 candles) is ~700+ candle objects —
+    way past free-tier TPM limits (Groq's 8B model caps at 6000 TPM). This trims it to
+    just what the LLM needs: fewer recent candles, compact [o,h,l,c] arrays instead of
+    repeated keys, and rounded prices."""
+    compact = {}
+    for symbol, timeframes in pairs_data.items():
+        if symbol == "_fetch_errors":
+            continue
+        compact[symbol] = {}
+        for tf, tf_data in timeframes.items():
+            candles = tf_data.get("candles", [])[-candles_per_tf:]
+            compact[symbol][tf] = {
+                "c": [[round(c["open"], 5), round(c["high"], 5), round(c["low"], 5), round(c["close"], 5)] for c in candles],
+                "sma20": round(tf_data["sma20"], 5) if tf_data.get("sma20") is not None else None,
+                "sma50": round(tf_data["sma50"], 5) if tf_data.get("sma50") is not None else None,
+                "rsi14": round(tf_data["rsi14"], 1) if tf_data.get("rsi14") is not None else None,
+            }
+    return compact
+
+
 async def _ask_gemini_scan(pairs_data: dict, news_context: str = "not checked this run") -> dict:
     """Gemini and Groq each independently analyze the same data, then a trade only
     fires if they agree — otherwise it's held as a split decision. Their reasoning
@@ -1119,11 +1141,13 @@ async def _ask_gemini_scan(pairs_data: dict, news_context: str = "not checked th
     if not GEMINI_API_KEY and not GROQ_API_KEY:
         raise HTTPException(500, "Neither GEMINI_API_KEY nor GROQ_API_KEY is set on the server")
 
+    candles_per_tf = 10
     prompt = SCAN_PROMPT.format(
         risk_notes=settings["risk_notes"] or "No specific preferences stated — use conservative default risk management.",
         min_confidence=MIN_CONFIDENCE,
         news_context=news_context,
-        pairs_json=json.dumps(pairs_data),
+        candles_per_tf=candles_per_tf,
+        pairs_json=json.dumps(_compact_for_prompt(pairs_data, candles_per_tf)),
     )
 
     async def _try(name, fn):
