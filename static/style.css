@@ -444,6 +444,35 @@ button {
 }
 .ai-convo-label { flex-shrink: 0; color: var(--blue); font-weight: 600; }
 .ai-convo-text { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.ai-conversation-bar { cursor: pointer; transition: background 0.15s; }
+.ai-conversation-bar:hover { background: #10151d; }
+.ai-convo-expand { flex-shrink: 0; margin-left: auto; color: var(--blue); font-size: 11px; }
+
+/* Council discussion modal */
+.council-panel { max-width: 560px; width: 100%; }
+.council-feed {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  margin-top: 12px;
+  max-height: 60vh;
+  overflow-y: auto;
+  padding-right: 4px;
+}
+.council-msg {
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 10px 12px;
+  background: #0e1218;
+}
+.council-msg-top { display: flex; justify-content: space-between; align-items: center; margin-bottom: 4px; }
+.council-speaker { font-size: 11px; font-weight: 700; letter-spacing: 0.03em; color: var(--text); }
+.council-time { font-size: 11px; color: var(--muted); }
+.council-text { font-size: 13px; color: var(--text); line-height: 1.4; }
+.council-gemini .council-speaker { color: var(--blue); }
+.council-groq .council-speaker { color: var(--green-buy); }
+.council-deepseek .council-speaker { color: #b98af0; }
+.council-council { border-color: rgba(47,109,255,0.35); background: rgba(47,109,255,0.06); }
 
 .tradelog-row-clickable { cursor: pointer; transition: border-color 0.15s, background 0.15s; }
 .tradelog-row-clickable:hover { border-color: var(--blue); background: #121826; }
