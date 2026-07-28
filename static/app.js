@@ -249,9 +249,9 @@ async function refreshAutotradeLog() {
       el.innerHTML = `<p class="empty-note">No AI checks yet — will appear here once the scheduler starts running</p>`;
       return;
     }
-    log.forEach((entry) => {
+    log.forEach((entry, idx) => {
       const row = document.createElement("div");
-      row.className = "autotrade-row";
+      row.className = "autotrade-row autotrade-row-clickable";
       const time = new Date(entry.time).toLocaleString();
       const decision = entry.decision || {};
       const marketNote = entry.market ? (entry.market.is_open ? "Market: open" : "Market: CLOSED (not enforced yet)") : "";
@@ -261,6 +261,14 @@ async function refreshAutotradeLog() {
       if (entry.status === "trade_placed") { statusClass = "at-trade"; statusLabel = decision.action ? decision.action.toUpperCase() : "TRADE"; }
       else if (entry.status === "error") { statusClass = "at-error"; statusLabel = "ERROR"; }
       else if (entry.status === "skipped") { statusClass = "at-skip"; statusLabel = "SKIPPED"; }
+
+      const detailId = `at-detail-${idx}`;
+      const scanned = decision.scanned || {};
+      const scannedRows = Object.keys(scanned).length
+        ? Object.entries(scanned).map(([sym, d]) => `<div class="at-detail-row"><strong>${sym}</strong>: ${JSON.stringify(d)}</div>`).join("")
+        : "";
+      const council = entry.council ? `<div class="at-detail-row"><strong>Council:</strong> lead ${entry.council.lead_action || ""} ${entry.council.lead_symbol || ""}, DeepSeek agree: ${entry.council.deepseek_agree === null ? "n/a" : entry.council.deepseek_agree}${entry.council.deepseek_note ? " — " + entry.council.deepseek_note : ""}</div>` : "";
+
       row.innerHTML = `
         <div class="at-top">
           <span class="at-badge ${statusClass}">${statusLabel}</span>
@@ -268,7 +276,19 @@ async function refreshAutotradeLog() {
         </div>
         <div class="at-reason">${entry.reason || decision.reason || ""}</div>
         ${marketNote || newsNote ? `<div class="at-meta">${[marketNote, newsNote].filter(Boolean).join(" · ")}</div>` : ""}
+        <div id="${detailId}" class="at-detail" style="display:none;">
+          ${decision.action ? `<div class="at-detail-row"><strong>Decision:</strong> ${decision.action.toUpperCase()} ${decision.best_symbol || ""} — confidence ${decision.confidence ?? "?"}%</div>` : ""}
+          ${decision.stop_loss ? `<div class="at-detail-row"><strong>SL:</strong> ${decision.stop_loss} &nbsp; <strong>TP:</strong> ${decision.take_profit ?? "-"}</div>` : ""}
+          ${decision.reason ? `<div class="at-detail-row"><strong>Full reasoning:</strong> ${decision.reason}</div>` : ""}
+          ${council}
+          ${entry.hold_reason ? `<div class="at-detail-row"><strong>Hold reason:</strong> ${entry.hold_reason}</div>` : ""}
+          ${scannedRows ? `<div class="at-detail-row"><strong>Per-pair scan:</strong></div>${scannedRows}` : ""}
+        </div>
       `;
+      row.onclick = () => {
+        const d = document.getElementById(detailId);
+        d.style.display = d.style.display === "none" ? "block" : "none";
+      };
       el.appendChild(row);
     });
   } catch (err) {
