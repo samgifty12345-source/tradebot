@@ -4,6 +4,10 @@ let chart = null;
 let candleSeries = null;
 let currentInterval = "1min";
 let chartPollInterval = null;
+let lastFormattedCandles = [];
+let lastBoundaryMarkers = [];
+let lastPositionMarkers = [];
+let lastPositionsForMarkers = [];
 
 // ---------- Searchable pair dropdown ----------
 
@@ -347,6 +351,46 @@ async function refreshAccount() {
   `;
 }
 
+function findNearestCandleTime(entryTimeSec) {
+  if (!lastFormattedCandles.length) return null;
+  let chosen = lastFormattedCandles[0].time;
+  for (const c of lastFormattedCandles) {
+    if (c.time <= entryTimeSec) chosen = c.time;
+    else break;
+  }
+  return chosen;
+}
+
+function computeEntryMarkers(positions, chartSymbol) {
+  if (!lastFormattedCandles.length) return [];
+  const markers = [];
+  positions.forEach((p) => {
+    if (p.symbol !== chartSymbol) return;
+    const openIso = p.open_time || p.time || p.openTime;
+    if (!openIso) return;
+    const entrySec = Math.floor(new Date(openIso).getTime() / 1000);
+    if (isNaN(entrySec)) return;
+    const snapped = findNearestCandleTime(entrySec);
+    if (snapped === null) return;
+    const side = (p.side || p.type || "").toLowerCase();
+    const isBuy = side.includes("buy");
+    markers.push({
+      time: snapped,
+      position: "inBar",
+      color: isBuy ? "#2f6dff" : "#f5a623",
+      shape: "circle",
+      size: 1,
+    });
+  });
+  return markers;
+}
+
+function applyChartMarkers() {
+  if (!candleSeries) return;
+  const merged = [...lastBoundaryMarkers, ...lastPositionMarkers].sort((a, b) => a.time - b.time);
+  candleSeries.setMarkers(merged);
+}
+
 let activePriceLines = [];
 
 function clearPositionLines() {
@@ -359,6 +403,10 @@ function drawPositionLines(positions) {
   if (!candleSeries) return;
   clearPositionLines();
   const chartSymbol = (document.getElementById("chart-symbol").value || "").toUpperCase().replace("/", "");
+
+  lastPositionsForMarkers = positions;
+  lastPositionMarkers = computeEntryMarkers(positions, chartSymbol);
+  applyChartMarkers();
 
   positions.forEach((p) => {
     if (p.symbol !== chartSymbol) return; // only draw lines for the symbol currently on screen
@@ -771,7 +819,10 @@ async function loadChartHistory() {
     }));
     candleSeries.priceScale().applyOptions({ autoScale: true });
     candleSeries.setData(formatted);
-    candleSeries.setMarkers(computeBoundaryMarkers(formatted, currentInterval));
+    lastFormattedCandles = formatted;
+    lastBoundaryMarkers = computeBoundaryMarkers(formatted, currentInterval);
+    lastPositionMarkers = computeEntryMarkers(lastPositionsForMarkers, (document.getElementById("chart-symbol").value || "").toUpperCase().replace("/", ""));
+    applyChartMarkers();
     chart.timeScale().fitContent();
   } catch (err) {
     statusEl.style.color = "#ef4655";
