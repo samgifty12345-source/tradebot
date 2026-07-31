@@ -753,145 +753,204 @@ MANAGE_CHECK_INTERVAL_WHEN_MAXED = int(os.getenv("MANAGE_CHECK_INTERVAL_WHEN_MAX
 _last_maxed_check = {"time": None}
 
 
-async def _run_autotrade_sim():
-    autotrade_status.update({"state": "analyzing", "since": datetime.now(timezone.utc).isoformat(), "note": "Scanning watchlist..."})
-    entry = {"time": datetime.now(timezone.utc).isoformat()}
-    entry["market"] = _market_status()  # logged only — not enforced yet, per Icon's instruction
+async def _sim_positions():
+    return list(sim_account["positions"])
 
-    run_number_today = _bump_daily_run_count()
-    if run_number_today <= 3:
-        entry["news_check"] = await _fetch_forex_news()
 
-    try:
-        at_max = len(sim_account["positions"]) >= MAX_OPEN_POSITIONS
+async def _run_trade_leg(*, label: str, provider: str, positions: list, pairs_data: dict,
+                          news_context: str, place_trade, get_price, entry_base: dict) -> dict:
+    """One AI's independent decision + execution against one account (real+Gemini or
+    sim+Groq). Both legs share this exact risk pipeline — stack rules, staleness
+    check, DeepSeek veto — so a future change only has to be made once."""
+    entry = dict(entry_base)
+    entry["account"] = label
 
-        if at_max:
-            now_ts = datetime.now(timezone.utc).timestamp()
-            last = _last_maxed_check["time"]
-            if last is not None and now_ts - last < MANAGE_CHECK_INTERVAL_WHEN_MAXED:
-                remaining_min = int((MANAGE_CHECK_INTERVAL_WHEN_MAXED - (now_ts - last)) / 60)
-                entry.update({"status": "skipped", "reason": f"At max positions — next safety check in ~{remaining_min} min"})
-                autotrade_log.append(entry)
-                del autotrade_log[:-50]
-                autotrade_status.update({"state": "idle", "note": f"At max positions — next check in ~{remaining_min} min"})
-                return
-            _last_maxed_check["time"] = now_ts
+    open_count = len(positions)
+    if open_count >= MAX_OPEN_POSITIONS:
+        entry.update({"status": "skipped", "reason": f"{open_count} open {label} position(s), max is {MAX_OPEN_POSITIONS}"})
+        return entry
 
-        closed = await _manage_sim_positions()
-        if closed:
-            entry["closed_positions"] = closed
+    scan = await _ask_single_ai_scan(provider, pairs_data, news_context)
+    entry["scanned"] = scan.get("scanned", {})
 
-        if at_max:
-            still_open = len(sim_account["positions"])
-            entry.update({"status": "skipped", "reason": f"{still_open} open sim position(s), max is {MAX_OPEN_POSITIONS} — checked safety, no new entries"})
-            autotrade_log.append(entry)
-            del autotrade_log[:-50]
-            autotrade_status.update({"state": "idle", "note": f"Safety check done — at max open positions ({MAX_OPEN_POSITIONS})"})
-            return
+    action = scan.get("action", "hold")
+    best_symbol = scan.get("best_symbol")
+    confidence = scan.get("confidence", 0)
+    min_confidence = _current_min_confidence()
+    already_holding = best_symbol and any(p["symbol"] == best_symbol for p in positions)
 
-        pairs_data = await _fetch_multi_snapshot()
-        if pairs_data.get("_fetch_errors"):
-            entry["fetch_errors"] = pairs_data["_fetch_errors"]
+    stack_reason = None
+    if action in ("buy", "sell") and best_symbol and confidence >= min_confidence:
+        if already_holding:
+            stack_reason = f"Already holding an open position on {best_symbol} — skipping duplicate"
+        elif open_count > 0 and confidence < STACK_MIN_CONFIDENCE:
+            stack_reason = f"{open_count} position(s) already open — need {STACK_MIN_CONFIDENCE}+ confidence to stack another, got {confidence}"
 
-        autotrade_status["note"] = "Lead AI analyzing setups..."
-        scan = await _ask_gemini_scan(pairs_data, entry.get("news_check", "not checked this run"))
-        entry["scanned"] = scan.get("scanned", {})
-
-        action = scan.get("action", "hold")
-        best_symbol = scan.get("best_symbol")
-        confidence = scan.get("confidence", 0)
-        open_count = len(sim_account["positions"])
-        already_holding_symbol = best_symbol and any(p["symbol"] == best_symbol for p in sim_account["positions"])
-
-        min_confidence = _current_min_confidence()
-        stack_reason = None
-        if action in ("buy", "sell") and best_symbol and confidence >= min_confidence:
-            if already_holding_symbol:
-                stack_reason = f"Already holding an open position on {best_symbol} — skipping duplicate"
-            elif open_count > 0 and confidence < STACK_MIN_CONFIDENCE:
-                stack_reason = f"{open_count} position(s) already open — need {STACK_MIN_CONFIDENCE}+ confidence to stack another, got {confidence}"
-
-        if action not in ("buy", "sell") or not best_symbol or confidence < min_confidence or stack_reason:
-            entry.update({"status": "hold", "decision": scan, "hold_reason": stack_reason})
-            autotrade_log.append(entry)
-            del autotrade_log[:-50]
-            autotrade_status.update({"state": "idle", "note": stack_reason or "Hold — no setup met the confidence bar"})
-            opinion = await _ask_deepseek_opinion(
-                f"Decision: HOLD ({stack_reason or f'no pair met the {min_confidence}+ confidence threshold'}). "
-                f"Full scan: {json.dumps(scan)[:2000]}"
-            )
-            if opinion:
-                deepseek_review["time"] = datetime.now(timezone.utc).isoformat()
-                deepseek_review["text"] = opinion
-            return
-
-        # Council check — DeepSeek reviews the lead AI's decision before it's allowed to fire.
-        autotrade_status["note"] = f"Council reviewing {action.upper()} {best_symbol}..."
-        council_context = (
-            f"Decision: {action.upper()} {best_symbol}, confidence {confidence}%, "
-            f"reason: {scan.get('reason', '')}. Full scan: {json.dumps(scan)[:2000]}"
-        )
-        verdict = await _ask_deepseek_verdict(council_context)
-
-        if verdict is not None and verdict.get("agree") is False:
-            entry.update({
-                "status": "hold",
-                "decision": scan,
-                "council": {"lead_action": action, "lead_symbol": best_symbol, "deepseek_agree": False, "deepseek_note": verdict.get("note")},
-            })
-            autotrade_log.append(entry)
-            del autotrade_log[:-50]
-            deepseek_review["time"] = datetime.now(timezone.utc).isoformat()
-            deepseek_review["text"] = f"Vetoed {action.upper()} {best_symbol}: {verdict.get('note', '')}"
-            autotrade_status.update({"state": "idle", "note": f"Council split — DeepSeek vetoed {action.upper()} {best_symbol}"})
-            return
-
-        # Staleness check — re-fetch price right before executing, since council deliberation
-        # takes real time and a demo fill at a stale price wouldn't be a valid fill in real life.
-        price_at_scan = await _get_price(best_symbol)
-        autotrade_status["note"] = f"Confirming price before executing {action.upper()} {best_symbol}..."
-        price_now = await _get_price(best_symbol)
-        moved_pct = abs(price_now - price_at_scan) / price_at_scan * 100 if price_at_scan else 0
-
-        if moved_pct > PRICE_STALENESS_PCT:
-            entry.update({
-                "status": "hold",
-                "decision": scan,
-                "reason": f"Price moved {moved_pct:.3f}% (>{PRICE_STALENESS_PCT}%) between decision and execution — stale, skipped",
-            })
-            autotrade_log.append(entry)
-            del autotrade_log[:-50]
-            autotrade_status.update({"state": "idle", "note": "Skipped — price moved too much before execution"})
-            return
-
-        volume = _smart_volume(best_symbol, confidence, entry_price=price_now, sl=scan.get("stop_loss"))
-        volume = _enforce_min_lot(best_symbol, round(volume * _current_lot_scale(), 2))
-        pos = await sim_trade({
-            "symbol": best_symbol, "side": action, "volume": volume,
-            "sl": scan.get("stop_loss"), "tp": scan.get("take_profit"),
-            "confidence": confidence, "reason": scan.get("reason", ""), "source": "autotrade-sim",
-        })
-        entry.update({
-            "status": "trade_placed",
-            "decision": scan,
-            "result": pos,
-            "council": {"lead_action": action, "lead_symbol": best_symbol, "deepseek_agree": None if verdict is None else True, "deepseek_note": (verdict or {}).get("note")},
-        })
-        autotrade_log.append(entry)
-        del autotrade_log[:-50]
-        autotrade_status.update({"state": "idle", "note": f"Placed {action.upper()} {volume} lots on {best_symbol}"})
+    if action not in ("buy", "sell") or not best_symbol or confidence < min_confidence or stack_reason:
+        entry.update({"status": "hold", "decision": scan, "hold_reason": stack_reason})
         opinion = await _ask_deepseek_opinion(
-            f"Decision: {action.upper()} {best_symbol} @ {volume} lots, confidence {confidence}%, "
-            f"reason: {scan.get('reason', '')}. Full scan: {json.dumps(scan)[:2000]}"
+            f"[{label}/{provider}] Decision: HOLD ({stack_reason or f'no pair met the {min_confidence}+ confidence threshold'}). "
+            f"Full scan: {json.dumps(scan)[:2000]}"
         )
         if opinion:
             deepseek_review["time"] = datetime.now(timezone.utc).isoformat()
-            deepseek_review["text"] = opinion
+            deepseek_review["text"] = f"[{label}/{provider}] {opinion}"
+        return entry
+
+    # Independent sanity check before firing — DeepSeek reviews this AI's decision.
+    # (Not a "must-agree" council anymore: Gemini and Groq each own their own account now.)
+    verdict_context = (
+        f"[{label}/{provider}] Decision: {action.upper()} {best_symbol}, confidence {confidence}%, "
+        f"reason: {scan.get('reason', '')}. Full scan: {json.dumps(scan)[:2000]}"
+    )
+    verdict = await _ask_deepseek_verdict(verdict_context)
+    if verdict is not None and verdict.get("agree") is False:
+        entry.update({
+            "status": "hold",
+            "decision": scan,
+            "veto": {"deepseek_agree": False, "deepseek_note": verdict.get("note")},
+        })
+        deepseek_review["time"] = datetime.now(timezone.utc).isoformat()
+        deepseek_review["text"] = f"[{label}/{provider}] Vetoed {action.upper()} {best_symbol}: {verdict.get('note', '')}"
+        return entry
+
+    # Staleness check — re-fetch price right before executing, since the AI call and
+    # DeepSeek review both take real time. Applied to BOTH legs now (previously only sim had it).
+    try:
+        price_at_scan = await get_price(best_symbol)
+        price_now = await get_price(best_symbol)
+        moved_pct = abs(price_now - price_at_scan) / price_at_scan * 100 if price_at_scan else 0
+    except Exception:
+        price_now, moved_pct = None, 0
+
+    if moved_pct > PRICE_STALENESS_PCT:
+        entry.update({
+            "status": "hold",
+            "decision": scan,
+            "reason": f"Price moved {moved_pct:.3f}% (>{PRICE_STALENESS_PCT}%) between decision and execution — stale, skipped",
+        })
+        return entry
+
+    volume = _smart_volume(best_symbol, confidence, entry_price=price_now, sl=scan.get("stop_loss"))
+    volume = _enforce_min_lot(best_symbol, round(volume * _current_lot_scale(), 2))
+
+    try:
+        result = await place_trade(best_symbol, action, volume, scan)
     except Exception as e:
-        entry.update({"status": "error", "reason": str(e)})
-        autotrade_log.append(entry)
+        entry.update({"status": "error", "reason": f"trade execution failed: {str(e)[:200]}"})
+        return entry
+
+    entry.update({"status": "trade_placed", "decision": scan, "result": result})
+    opinion = await _ask_deepseek_opinion(
+        f"[{label}/{provider}] Decision: {action.upper()} {best_symbol} @ {volume} lots, confidence {confidence}%, "
+        f"reason: {scan.get('reason', '')}. Full scan: {json.dumps(scan)[:2000]}"
+    )
+    if opinion:
+        deepseek_review["time"] = datetime.now(timezone.utc).isoformat()
+        deepseek_review["text"] = f"[{label}/{provider}] {opinion}"
+    return entry
+
+
+async def _run_autotrade_cycle():
+    """One scan cycle, one shared market snapshot, two independent AIs each trading
+    their own account: Gemini decides for the real MetaApi account, Groq decides for
+    the built-in sim account. This is the single thing every trigger (cron, dashboard
+    button, internal scheduler) calls now — no second cron job needed to compare them."""
+    if autotrade_status.get("state") == "analyzing":
+        return  # already running (internal scheduler + external cron overlapped) — skip
+    autotrade_status.update({"state": "analyzing", "since": datetime.now(timezone.utc).isoformat(), "note": "Scanning watchlist..."})
+
+    market = _market_status()
+    if MARKET_HOURS_ENABLED and not market["is_open"]:
+        autotrade_log.append({"time": datetime.now(timezone.utc).isoformat(), "market": market,
+                               "status": "skipped", "reason": "Market closed (MARKET_HOURS_ENABLED)"})
         del autotrade_log[:-50]
-        autotrade_status.update({"state": "idle", "note": f"Error: {str(e)[:120]}"})
+        autotrade_status.update({"state": "idle", "note": "Market closed — skipped this cycle"})
+        return
+
+    run_number_today = _bump_daily_run_count()
+    news_context = await _fetch_forex_news() if run_number_today <= 3 else "not checked this run"
+    entry_base = {"time": datetime.now(timezone.utc).isoformat(), "market": market, "news_check": news_context}
+
+    # ---- Real / Gemini leg setup ----
+    real_available = all([MT_LOGIN, MT_PASSWORD, MT_SERVER])
+    real_conn, real_positions = None, []
+    if real_available:
+        try:
+            _, real_conn = await _connect_account(MT_LOGIN, MT_PASSWORD, MT_SERVER, MT_PLATFORM)
+            closed = await _manage_real_positions()
+            real_positions = await real_conn.get_positions()
+            if closed:
+                entry_base["real_closed"] = closed
+        except Exception as e:
+            real_available = False
+            autotrade_log.append({**entry_base, "account": "real", "status": "error",
+                                   "reason": f"MetaApi connect/fetch failed: {str(e)[:200]}"})
+
+    # ---- Sim / Groq leg setup (with the existing "at max" cooldown so we're not
+    # hammering the safety-close check every cycle once the book is full) ----
+    sim_at_max = len(sim_account["positions"]) >= MAX_OPEN_POSITIONS
+    run_sim_safety_check = True
+    if sim_at_max:
+        now_ts = datetime.now(timezone.utc).timestamp()
+        last = _last_maxed_check["time"]
+        run_sim_safety_check = last is None or now_ts - last >= MANAGE_CHECK_INTERVAL_WHEN_MAXED
+        if run_sim_safety_check:
+            _last_maxed_check["time"] = now_ts
+    if run_sim_safety_check:
+        closed = await _manage_sim_positions()
+        if closed:
+            entry_base["sim_closed"] = closed
+    sim_positions = await _sim_positions()
+
+    real_has_room = real_available and len(real_positions) < MAX_OPEN_POSITIONS
+    sim_has_room = len(sim_positions) < MAX_OPEN_POSITIONS
+
+    if not real_has_room and not sim_has_room:
+        legs = (["real"] if real_available else []) + ["sim"]
+        for label in legs:
+            autotrade_log.append({**entry_base, "account": label, "status": "skipped",
+                                   "reason": f"At max positions, max is {MAX_OPEN_POSITIONS}"})
+        del autotrade_log[:-50]
+        autotrade_status.update({"state": "idle", "note": "Both accounts at max positions — skipped scan"})
+        return
+
+    # One shared snapshot for both AIs — this is the whole point of merging the two
+    # cron paths: Twelve Data's free-tier budget only gets spent once per cycle now.
+    pairs_data = await _fetch_multi_snapshot()
+    if pairs_data.get("_fetch_errors"):
+        entry_base["fetch_errors"] = pairs_data["_fetch_errors"]
+
+    results = []
+    if real_available:
+        autotrade_status["note"] = "Gemini analyzing real-account setups..."
+        results.append(await _run_trade_leg(
+            label="real", provider="gemini", positions=real_positions, pairs_data=pairs_data,
+            news_context=news_context, entry_base=entry_base, get_price=_get_price,
+            place_trade=lambda symbol, action, volume, scan: _place_trade(
+                real_conn, symbol, action, volume, sl=scan.get("stop_loss"), tp=scan.get("take_profit"),
+                confidence=scan.get("confidence", 0), reason=scan.get("reason", ""), source="autotrade", account="real",
+            ),
+        ))
+    elif not all([MT_LOGIN, MT_PASSWORD, MT_SERVER]):
+        results.append({**entry_base, "account": "real", "status": "skipped",
+                         "reason": "MT_LOGIN/MT_PASSWORD/MT_SERVER not set — real leg disabled"})
+
+    autotrade_status["note"] = "Groq analyzing sim-account setups..."
+    results.append(await _run_trade_leg(
+        label="sim", provider="groq", positions=sim_positions, pairs_data=pairs_data,
+        news_context=news_context, entry_base=entry_base, get_price=_get_price,
+        place_trade=lambda symbol, action, volume, scan: sim_trade({
+            "symbol": symbol, "side": action, "volume": volume,
+            "sl": scan.get("stop_loss"), "tp": scan.get("take_profit"),
+            "confidence": scan.get("confidence", 0), "reason": scan.get("reason", ""), "source": "autotrade-sim",
+        }),
+    ))
+
+    autotrade_log.extend(results)
+    del autotrade_log[:-50]
+    placed = [r["account"] for r in results if r.get("status") == "trade_placed"]
+    autotrade_status.update({"state": "idle", "note": f"Done — placed on: {', '.join(placed) if placed else 'none (hold on both)'}"})
 
 
 @app.get("/api/ai-conversation")
@@ -906,12 +965,11 @@ async def get_autotrade_status():
 
 @app.post("/api/autotrade-run")
 async def autotrade_run(background_tasks: BackgroundTasks):
-    """Manual trigger for the 'Run Scan Now' button on the dashboard — same scan as the
-    cron-triggered /api/autotrade-sim, just without the secret since it's only reachable
-    from inside the dashboard itself."""
+    """Manual trigger for the 'Run Scan Now' button on the dashboard — runs the same
+    dual-account cycle (Gemini -> real, Groq -> sim) as the cron-triggered endpoints."""
     if autotrade_status.get("state") == "analyzing":
         return {"status": "already_running", "note": "A scan is already in progress"}
-    background_tasks.add_task(_run_autotrade_sim)
+    background_tasks.add_task(_run_autotrade_cycle)
     return {"status": "started"}
 
 
@@ -926,13 +984,12 @@ async def autotrade_sim_head(secret: str = Query(...)):
 
 @app.get("/api/autotrade-sim")
 async def autotrade_sim(secret: str = Query(...), background_tasks: BackgroundTasks = None):
-    """Same AI scan as the real autotrade loop, but trades the built-in demo
-    account. Returns immediately — the actual scan (which can take a couple
-    minutes due to free-tier rate limits) runs in the background and the
-    result appears in the dashboard's AI Auto-Trade Log a bit later."""
+    """Kept for backward compatibility with any cron already pointed at this URL —
+    now triggers the SAME dual-account cycle as /api/autotrade (Gemini -> real,
+    Groq -> sim), so you don't need two cron jobs pointed at two different endpoints."""
     if not AUTOTRADE_SECRET or secret != AUTOTRADE_SECRET:
         raise HTTPException(403, "Invalid secret")
-    background_tasks.add_task(_run_autotrade_sim)
+    background_tasks.add_task(_run_autotrade_cycle)
     return {"status": "started", "note": "Scan running in background — check the AI Auto-Trade Log on your dashboard in ~2-3 min"}
 
 
@@ -985,7 +1042,7 @@ def _smart_volume(symbol: str, confidence: float, entry_price=None, sl=None) -> 
     return round(max(scaled, MIN_LOT[cls]), 2)
 
 WATCHLIST = ["XAUUSD", "EURUSD", "GBPUSD", "USDJPY", "BTCUSD", "ETHUSD"]
-SCAN_TIMEFRAMES = ["15min", "30min", "1h", "4h"]
+SCAN_TIMEFRAMES = ["15min", "1h", "4h"]  # 30min dropped — it was fetched but never reached the prompt
 MIN_CONFIDENCE = int(os.getenv("MIN_CONFIDENCE", "70"))
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-flash-latest")  # override via env var if needed
 
@@ -1194,7 +1251,9 @@ rather than re-deriving them.
 
 For EACH pair, analyze for: liquidity sweeps, break of structure (BOS), change of character (CHoCH),
 fair value gaps (FVG), order blocks, and notable candle patterns (doji, engulfing, pin bars).
-Use the 1h timeframe to judge overall bias/direction, and the 15min timeframe to judge entry timing.
+Use the 4h timeframe to establish higher-timeframe directional bias, the 1h timeframe to confirm
+structure within that bias, and the 15min timeframe to judge entry timing. Only take a 15min/1h
+entry that agrees with the 4h bias — don't fight the higher timeframe.
 Give each pair a confidence score 0-100 for a trade opportunity RIGHT NOW (0 = no setup, 100 = extremely clear).
 
 Trader's risk management preferences (respect these strictly): {risk_notes}
@@ -1306,7 +1365,7 @@ def _log_conversation(speaker: str, text: str):
     del ai_conversation[:-40]
 
 
-PROMPT_TIMEFRAMES = ["15min", "1h"]  # the two timeframes the prompt actually asks the AI to use
+PROMPT_TIMEFRAMES = ["15min", "1h", "4h"]  # all three timeframes the prompt actually asks the AI to use
 
 
 def _compact_for_prompt(pairs_data: dict, candles_per_tf: int = 12) -> dict:
@@ -1601,7 +1660,12 @@ async def _github_save_state():
     if sha:
         body["sha"] = sha
     async with httpx.AsyncClient() as client:
-        await client.put(url, headers=headers, json=body)
+        r = await client.put(url, headers=headers, json=body)
+    if r.status_code not in (200, 201):
+        # Most common cause: two saves racing (stale sha -> 409/422). Log loudly instead
+        # of losing sync silently — Railway logs will show this even without a UI for it.
+        print(f"[github_save_state] FAILED ({r.status_code}): {r.text[:300]}")
+    return r.status_code in (200, 201)
 
 
 chat_history = []  # list of {role, text} — persisted to GitHub
