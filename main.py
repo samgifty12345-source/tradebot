@@ -866,6 +866,22 @@ async def _run_autotrade():
             autotrade_status.update({"state": "idle", "note": "Skipped — price moved too much before execution"})
             return
 
+        # SL/TP sanity gate — reject before either venue trades if the AI's stop loss or
+        # take profit is on the wrong side of entry, zero-distance, or wildly disconnected
+        # from the real current price (e.g. a hallucinated price level).
+        sl_ok, sl_reason = _validate_sl_tp(action, price_now, scan.get("stop_loss"), scan.get("take_profit"))
+        if not sl_ok:
+            entry.update({
+                "status": "hold",
+                "decision": scan,
+                "reason": f"Rejected — invalid SL/TP: {sl_reason}",
+            })
+            autotrade_log.append(entry)
+            del autotrade_log[:-50]
+            _log_conversation("System", f"Blocked {action.upper()} {best_symbol} — {sl_reason}")
+            autotrade_status.update({"state": "idle", "note": f"Blocked — invalid SL/TP ({sl_reason[:80]})"})
+            return
+
         venues = {}
 
         # ---- Sim venue ----
@@ -1174,6 +1190,44 @@ deepseek_review = {"time": None, "text": None}
 autotrade_status = {"state": "idle", "since": None, "note": None}
 
 PRICE_STALENESS_PCT = float(os.getenv("PRICE_STALENESS_PCT", "0.15"))  # abort trade if price moved >0.15% since scan
+MAX_SL_TP_DISTANCE_PCT = float(os.getenv("MAX_SL_TP_DISTANCE_PCT", "20"))  # reject SL/TP more than this % from entry
+
+
+def _validate_sl_tp(side: str, entry: float, sl, tp) -> tuple[bool, str]:
+    """Hard sanity gate on AI-generated SL/TP before ANY trade executes on either venue.
+    The prompt tells the model to keep these "realistic," but nothing enforced that —
+    it has returned SL/TP on the wrong side of entry, equal to entry (zero-distance,
+    instant stop-out), and price levels wildly disconnected from the real market (e.g.
+    gold SL/TP near $1785 while XAUUSD was actually trading near $4055). Catch all of
+    that here instead of trusting the model's numbers blindly."""
+    if entry is None or entry <= 0:
+        return False, "No valid entry price to validate against"
+    if sl is None or tp is None:
+        return False, "Missing stop loss or take profit"
+    if sl == entry:
+        return False, f"Stop loss equals entry ({sl}) — zero-distance stop, would trigger on the first tick"
+    if tp == entry:
+        return False, f"Take profit equals entry ({tp}) — zero-distance target"
+
+    if side == "buy":
+        if sl >= entry:
+            return False, f"BUY stop loss ({sl}) must be below entry ({entry}) — it's on the wrong side"
+        if tp <= entry:
+            return False, f"BUY take profit ({tp}) must be above entry ({entry}) — it's on the wrong side"
+    else:  # sell
+        if sl <= entry:
+            return False, f"SELL stop loss ({sl}) must be above entry ({entry}) — it's on the wrong side"
+        if tp >= entry:
+            return False, f"SELL take profit ({tp}) must be below entry ({entry}) — it's on the wrong side"
+
+    sl_pct = abs(entry - sl) / entry * 100
+    tp_pct = abs(tp - entry) / entry * 100
+    if sl_pct > MAX_SL_TP_DISTANCE_PCT or tp_pct > MAX_SL_TP_DISTANCE_PCT:
+        return False, (
+            f"SL/TP too far from entry (SL {sl_pct:.1f}%, TP {tp_pct:.1f}% away, max {MAX_SL_TP_DISTANCE_PCT}%) "
+            f"— likely a stale or hallucinated price level, not the real current price"
+        )
+    return True, ""
 
 DEEPSEEK_VERDICT_PROMPT = """You are the second seat on a two-AI trading council. The lead AI just
 finished a scan cycle and wants to act on this decision:
@@ -1933,6 +1987,17 @@ async def chat(payload: dict = Body(...)):
 
     if close_action:
         trade_action = None  # never fake a close via an opposite trade_action
+
+    if trade_action and trade_action.get("side") in ("buy", "sell"):
+        trade_symbol = trade_action.get("symbol") or settings["symbol"]
+        trade_volume = _enforce_min_lot(trade_symbol, trade_action.get("volume") or _base_lot_for_symbol(trade_symbol))
+
+        if trade_action.get("stop_loss") is not None and trade_action.get("take_profit") is not None:
+            trade_entry_est = await _get_price(trade_symbol)
+            sl_ok, sl_reason = _validate_sl_tp(trade_action["side"], trade_entry_est, trade_action.get("stop_loss"), trade_action.get("take_profit"))
+            if not sl_ok:
+                reply += f"\n\n⚠️ Didn't place that trade — the SL/TP looked wrong: {sl_reason}"
+                trade_action = None
 
     if trade_action and trade_action.get("side") in ("buy", "sell"):
         trade_symbol = trade_action.get("symbol") or settings["symbol"]
