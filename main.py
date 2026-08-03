@@ -1038,7 +1038,8 @@ def _smart_volume(symbol: str, confidence: float, entry_price=None, sl=None) -> 
     return round(max(scaled, MIN_LOT[cls]), 2)
 
 WATCHLIST = ["XAUUSD", "EURUSD", "GBPUSD", "USDJPY", "BTCUSD", "ETHUSD"]
-SCAN_TIMEFRAMES = ["15min", "30min", "1h", "4h"]
+SCAN_TIMEFRAMES = ["15min", "1h"]  # only fetch what the prompt actually uses (see PROMPT_TIMEFRAMES) — was
+                                    # also pulling 30min/4h before, which cost Twelve Data credits for nothing
 MIN_CONFIDENCE = int(os.getenv("MIN_CONFIDENCE", "70"))
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-flash-latest")  # override via env var if needed
 
@@ -1391,9 +1392,9 @@ def _compact_for_prompt(pairs_data: dict, candles_per_tf: int = 12) -> dict:
 
 
 async def _ask_gemini_scan(pairs_data: dict, news_context: str = "not checked this run") -> dict:
-    """Gemini and Groq each independently analyze the same data, then a trade only
-    fires if they agree — otherwise it's held as a split decision. Their reasoning
-    is logged as a live conversation for the dashboard."""
+    """Gemini and Groq each independently analyze the same data, but only Groq's
+    decision is ever executed — Gemini is on hold, its read is logged for comparison
+    only. Their reasoning is logged as a live conversation for the dashboard."""
     if not GEMINI_API_KEY and not GROQ_API_KEY:
         raise HTTPException(500, "Neither GEMINI_API_KEY nor GROQ_API_KEY is set on the server")
 
