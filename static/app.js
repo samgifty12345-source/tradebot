@@ -100,22 +100,40 @@ async function connectAccount() {
   const server = document.getElementById("server").value;
   const platform = document.getElementById("platform").value;
 
-  document.getElementById("login-status").innerText = "Connecting... (can take 30-60s first time)";
+  document.getElementById("login-status").innerText = "Connecting... (can take 30-90s first time)";
 
   try {
-    const res = await fetch(`${API_BASE}/api/connect`, {
+    const startRes = await fetch(`${API_BASE}/api/connect-start`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ login, password, server, platform }),
     });
-    const data = await res.json();
-    if (!res.ok) {
-      document.getElementById("login-status").innerText = data.detail || "Connect failed";
+    const startData = await startRes.json();
+    if (!startRes.ok) {
+      document.getElementById("login-status").innerText = startData.detail || "Connect failed";
       return;
     }
-    accountId = data.accountId;
-    localStorage.setItem("accountId", accountId);
-    showDashboard();
+
+    const requestId = startData.requestId;
+    const maxAttempts = 40; // ~2 min of polling at 3s apart
+    for (let i = 0; i < maxAttempts; i++) {
+      await new Promise((r) => setTimeout(r, 3000));
+      const res = await fetch(`${API_BASE}/api/connect-status/${requestId}`);
+      const data = await res.json();
+
+      if (data.state === "connected") {
+        accountId = data.accountId;
+        localStorage.setItem("accountId", accountId);
+        showDashboard();
+        return;
+      }
+      if (data.state === "error") {
+        document.getElementById("login-status").innerText = "Failed: " + data.error;
+        return;
+      }
+      document.getElementById("login-status").innerText = `Connecting... (${(i + 1) * 3}s)`;
+    }
+    document.getElementById("login-status").innerText = "Still connecting after 2 min — MetaApi may be having issues. Try again shortly.";
   } catch (err) {
     document.getElementById("login-status").innerText = "Failed: " + err.message;
   }
