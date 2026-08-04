@@ -948,7 +948,7 @@ async def _run_autotrade_cycle():
     entry_base = {"time": datetime.now(timezone.utc).isoformat(), "market": market, "news_check": news_context}
 
     # ---- Real / Gemini leg setup ----
-    real_available = all([MT_LOGIN, MT_PASSWORD, MT_SERVER])
+    real_available = REAL_LEG_ENABLED and all([MT_LOGIN, MT_PASSWORD, MT_SERVER])
     real_conn, real_positions = None, []
     if real_available:
         try:
@@ -961,6 +961,8 @@ async def _run_autotrade_cycle():
             real_available = False
             autotrade_log.append({**entry_base, "account": "real", "status": "error",
                                    "reason": f"MetaApi connect/fetch failed: {str(e)[:200]}"})
+    elif not REAL_LEG_ENABLED:
+        pass  # real leg intentionally paused — skip silently, no connect attempt, no log spam
 
     # ---- Sim / Groq leg setup (with the existing "at max" cooldown so we're not
     # hammering the safety-close check every cycle once the book is full) ----
@@ -1082,6 +1084,7 @@ MT_LOGIN = os.getenv("MT_LOGIN", "")
 MT_PASSWORD = os.getenv("MT_PASSWORD", "")
 MT_SERVER = os.getenv("MT_SERVER", "")
 MT_PLATFORM = os.getenv("MT_PLATFORM", "mt5")
+REAL_LEG_ENABLED = os.getenv("REAL_LEG_ENABLED", "true").lower() == "true"  # set to "false" to skip MetaApi entirely and run sim-only
 TRADE_VOLUME_DEFAULT = float(os.getenv("TRADE_VOLUME", "0.01"))
 MAX_OPEN_POSITIONS = int(os.getenv("MAX_OPEN_POSITIONS", "3"))
 STACK_MIN_CONFIDENCE = int(os.getenv("STACK_MIN_CONFIDENCE", "80"))  # bar to add another trade while one's already open
