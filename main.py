@@ -1,6 +1,7 @@
 import os
 import uuid
 import json
+import re
 import asyncio
 import base64
 from datetime import datetime, timezone
@@ -244,10 +245,11 @@ async def close_position(account_id: str, position_id: str):
 
 
 TWELVEDATA_API_KEY = os.getenv("TWELVEDATA_API_KEY", "")
+_twelvedata_backup_keys: list = []  # extra keys added via chat, tried in order if the primary key fails
 
 
 async def _fetch_candles(symbol: str, interval: str = "15min", outputsize: int = 50):
-    if not TWELVEDATA_API_KEY:
+    if not TWELVEDATA_API_KEY and not _twelvedata_backup_keys:
         raise HTTPException(500, "TWELVEDATA_API_KEY is not set on the server")
 
     # Twelve Data wants "XAU/USD" style, not "XAUUSD" — normalize either input
@@ -256,34 +258,31 @@ async def _fetch_candles(symbol: str, interval: str = "15min", outputsize: int =
         clean = f"{clean[:3]}/{clean[3:]}"
 
     url = "https://api.twelvedata.com/time_series"
-    params = {
-        "symbol": clean,
-        "interval": interval,
-        "outputsize": outputsize,
-        "apikey": TWELVEDATA_API_KEY,
-    }
-    async with httpx.AsyncClient() as client:
-        r = await client.get(url, params=params)
+    keys_to_try = ([TWELVEDATA_API_KEY] if TWELVEDATA_API_KEY else []) + _twelvedata_backup_keys
+    last_error = None
 
-    if r.status_code != 200:
-        raise HTTPException(502, f"Twelve Data HTTP {r.status_code}: {r.text[:200]}")
+    for key in keys_to_try:
+        params = {"symbol": clean, "interval": interval, "outputsize": outputsize, "apikey": key}
+        async with httpx.AsyncClient() as client:
+            r = await client.get(url, params=params)
 
-    data = r.json()
-    if data.get("status") == "error":
-        raise HTTPException(502, f"Twelve Data error: {data.get('message', 'unknown')} (code {data.get('code')})")
+        if r.status_code == 200:
+            data = r.json()
+            if data.get("status") != "error":
+                values = data.get("values", [])
+                return [
+                    {"time": v["datetime"], "open": float(v["open"]), "high": float(v["high"]),
+                     "low": float(v["low"]), "close": float(v["close"])}
+                    for v in reversed(values)
+                ]
+            last_error = f"Twelve Data error: {data.get('message', 'unknown')} (code {data.get('code')})"
+            # 429/credit-exhausted errors are worth trying the next key for; other errors
+            # (bad symbol, etc.) would fail on every key the same way, but trying costs
+            # little and keeps this simple.
+            continue
+        last_error = f"Twelve Data HTTP {r.status_code}: {r.text[:200]}"
 
-    values = data.get("values", [])
-    candles = [
-        {
-            "time": v["datetime"],
-            "open": float(v["open"]),
-            "high": float(v["high"]),
-            "low": float(v["low"]),
-            "close": float(v["close"]),
-        }
-        for v in reversed(values)
-    ]
-    return candles
+    raise HTTPException(502, last_error or "All Twelve Data keys failed")
 
 
 _chart_cache: Dict[str, tuple] = {}  # "symbol:interval:outputsize" -> (timestamp, candles)
@@ -1838,6 +1837,50 @@ async def _github_save_state():
 
 chat_history = []  # list of {role, text} — persisted to GitHub
 
+# ---------------- Backup Twelve Data API keys (separate GitHub file, per user request) ----------------
+TWELVEDATA_KEYS_FILE_PATH = "twelvedata_keys.json"
+
+
+async def _github_get_twelvedata_keys():
+    if not GITHUB_TOKEN or not GITHUB_REPO:
+        return None, None
+    url = f"https://api.github.com/repos/{GITHUB_REPO}/contents/{TWELVEDATA_KEYS_FILE_PATH}"
+    headers = {"Authorization": f"Bearer {GITHUB_TOKEN}", "Accept": "application/vnd.github+json"}
+    async with httpx.AsyncClient() as client:
+        r = await client.get(url, headers=headers, params={"ref": GITHUB_BRANCH})
+    if r.status_code == 200:
+        data = r.json()
+        content = base64.b64decode(data["content"]).decode()
+        return json.loads(content), data["sha"]
+    return None, None
+
+
+async def _github_save_twelvedata_keys():
+    if not GITHUB_TOKEN or not GITHUB_REPO:
+        return
+    _, sha = await _github_get_twelvedata_keys()
+    payload = {"keys": _twelvedata_backup_keys}
+    content_b64 = base64.b64encode(json.dumps(payload, indent=2).encode()).decode()
+    url = f"https://api.github.com/repos/{GITHUB_REPO}/contents/{TWELVEDATA_KEYS_FILE_PATH}"
+    headers = {"Authorization": f"Bearer {GITHUB_TOKEN}", "Accept": "application/vnd.github+json"}
+    body = {"message": "Update backup Twelve Data keys", "content": content_b64, "branch": GITHUB_BRANCH}
+    if sha:
+        body["sha"] = sha
+    async with httpx.AsyncClient() as client:
+        r = await client.put(url, headers=headers, json=body)
+    if r.status_code not in (200, 201):
+        print(f"[github_save_twelvedata_keys] FAILED ({r.status_code}): {r.text[:300]}")
+    return r.status_code in (200, 201)
+
+
+def _add_twelvedata_backup_key(key: str) -> bool:
+    key = key.strip()
+    if not key or key == TWELVEDATA_API_KEY or key in _twelvedata_backup_keys:
+        return False
+    _twelvedata_backup_keys.append(key)
+    return True
+
+
 
 AUTOTRADE_INTERVAL_SECONDS = int(os.getenv("AUTOTRADE_INTERVAL_SECONDS", "900"))  # 15 min
 HEARTBEAT_INTERVAL_SECONDS = int(os.getenv("HEARTBEAT_INTERVAL_SECONDS", "600"))  # 10 min
@@ -1882,6 +1925,11 @@ async def _load_state_on_startup():
         saved_trades = state.get("trade_log")
         if saved_trades:
             trade_log.extend(saved_trades)
+
+    key_state, _ = await _github_get_twelvedata_keys()
+    if key_state and key_state.get("keys"):
+        for k in key_state["keys"]:
+            _add_twelvedata_backup_key(k)
 
 
 @app.get("/api/chat/history")
@@ -1998,7 +2046,7 @@ trade_action and close_action are mutually exclusive — only one may be non-nul
 async def _live_data_snapshot():
     parts = []
     try:
-        candles = await _fetch_candles(settings["symbol"], interval=settings["interval"], outputsize=20)
+        candles = await _fetch_candles_cached(settings["symbol"], settings["interval"], outputsize=20)
         if candles:
             last = candles[-1]
             first = candles[0]
@@ -2012,7 +2060,7 @@ async def _live_data_snapshot():
     except Exception:
         parts.append(f"(couldn't fetch live price for {settings['symbol']} right now)")
 
-    if all([MT_LOGIN, MT_PASSWORD, MT_SERVER]):
+    if REAL_LEG_ENABLED and all([MT_LOGIN, MT_PASSWORD, MT_SERVER]):
         try:
             _, conn = await _connect_account(MT_LOGIN, MT_PASSWORD, MT_SERVER, MT_PLATFORM)
             info = await conn.get_account_information()
@@ -2025,6 +2073,8 @@ async def _live_data_snapshot():
                 parts.append("Open positions: none")
         except Exception:
             parts.append("(couldn't fetch account balance right now)")
+    elif not REAL_LEG_ENABLED:
+        parts.append("Real MT5 account: currently paused (REAL_LEG_ENABLED=false) — trading sim-only for now.")
 
     if autotrade_log:
         last_entry = autotrade_log[-1]
@@ -2060,6 +2110,24 @@ async def chat(payload: dict = Body(...)):
     message = payload.get("message", "")
     if not message:
         raise HTTPException(400, "message is required")
+
+    # Intercept "here's a twelve data api key ..." style messages before anything
+    # else touches this message — saved directly, never sent to an LLM prompt or log.
+    if "twelve" in message.lower() and "data" in message.lower():
+        key_match = re.search(r'\b([A-Za-z0-9]{20,})\b', message)
+        if key_match:
+            added = _add_twelvedata_backup_key(key_match.group(1))
+            await _github_save_twelvedata_keys()
+            reply_text = (
+                f"Got it — saved that as a backup Twelve Data key (you now have {len(_twelvedata_backup_keys)} backup key(s) on file). "
+                f"If your main key runs out of credits or hits its rate limit, this one gets tried automatically."
+                if added else
+                "That key's already saved (or matches the primary key) — no changes made."
+            )
+            chat_history.append({"role": "user", "text": "[added a Twelve Data backup key]"})  # never store the raw key in chat history
+            chat_history.append({"role": "model", "text": reply_text})
+            await _github_save_state()
+            return {"reply": reply_text, "settings": settings}
 
     # Talk to a specific council AI directly — either via the dropdown (payload["ai"])
     # or by typing "@deepseek ..." at the start of the message (kept for compatibility).
@@ -2143,7 +2211,7 @@ async def chat(payload: dict = Body(...)):
             result = await sim_close(pos["id"])
             closed.append(f"{pos['symbol']} ({result.get('pnl')} P/L, demo)")
 
-        real_account_available = all([MT_LOGIN, MT_PASSWORD, MT_SERVER])
+        real_account_available = REAL_LEG_ENABLED and all([MT_LOGIN, MT_PASSWORD, MT_SERVER])
         if real_account_available:
             try:
                 _, conn = await _connect_account(MT_LOGIN, MT_PASSWORD, MT_SERVER, MT_PLATFORM)
@@ -2171,7 +2239,7 @@ async def chat(payload: dict = Body(...)):
         trade_symbol = trade_action.get("symbol") or settings["symbol"]
         trade_volume = _enforce_min_lot(trade_symbol, trade_action.get("volume") or _base_lot_for_symbol(trade_symbol))
 
-        real_account_available = all([MT_LOGIN, MT_PASSWORD, MT_SERVER])
+        real_account_available = REAL_LEG_ENABLED and all([MT_LOGIN, MT_PASSWORD, MT_SERVER])
         placed_on = None
 
         if real_account_available:
