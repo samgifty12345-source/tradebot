@@ -753,6 +753,29 @@ MANAGE_CHECK_INTERVAL_WHEN_MAXED = int(os.getenv("MANAGE_CHECK_INTERVAL_WHEN_MAX
 _last_maxed_check = {"time": None}
 
 
+def _autocorrect_sl_tp(side: str, entry: float, sl, tp):
+    """Groq keeps flipping SL to the wrong side of entry (protective-side confusion
+    for buy vs sell) — this has now shown up on multiple different symbols, so it's
+    a recurring model mistake, not one-off noise. Instead of tossing the whole setup,
+    mirror the flipped level across entry at the same distance and let the caller
+    re-run _validate_sl_tp afterward — zero-distance and hallucinated-price cases
+    still get caught and rejected there. Returns (sl, tp, corrected: bool)."""
+    corrected = False
+    if entry is None or entry <= 0:
+        return sl, tp, corrected
+    if sl is not None and sl != entry:
+        wrong_side = (side == "buy" and sl >= entry) or (side == "sell" and sl <= entry)
+        if wrong_side:
+            sl = round(2 * entry - sl, 5)
+            corrected = True
+    if tp is not None and tp != entry:
+        wrong_side = (side == "buy" and tp <= entry) or (side == "sell" and tp >= entry)
+        if wrong_side:
+            tp = round(2 * entry - tp, 5)
+            corrected = True
+    return sl, tp, corrected
+
+
 async def _run_autotrade():
     """One shared scan per cycle. Groq is the only engine with execution rights — Gemini
     still scans and its read is logged for comparison, but stays on hold (see
@@ -866,8 +889,18 @@ async def _run_autotrade():
             autotrade_status.update({"state": "idle", "note": "Skipped — price moved too much before execution"})
             return
 
+        # Wrong-side SL/TP is a known recurring Groq mistake (protective-side confusion
+        # for buy vs sell) — mirror it across entry before validating, instead of just
+        # tossing the setup outright.
+        fixed_sl, fixed_tp, was_corrected = _autocorrect_sl_tp(action, price_now, scan.get("stop_loss"), scan.get("take_profit"))
+        if was_corrected:
+            entry["sl_tp_autocorrected"] = {"from": [scan.get("stop_loss"), scan.get("take_profit")], "to": [fixed_sl, fixed_tp]}
+            scan["stop_loss"], scan["take_profit"] = fixed_sl, fixed_tp
+            _log_conversation("System", f"Auto-corrected flipped SL/TP for {action.upper()} {best_symbol}: SL→{fixed_sl}, TP→{fixed_tp}")
+
         # SL/TP sanity gate — reject before either venue trades if the AI's stop loss or
-        # take profit is on the wrong side of entry, zero-distance, or wildly disconnected
+        # take profit is on the wrong side of entry (still possible if TP alone was wrong
+        # or the mirror still lands out of bounds), zero-distance, or wildly disconnected
         # from the real current price (e.g. a hallucinated price level).
         sl_ok, sl_reason = _validate_sl_tp(action, price_now, scan.get("stop_loss"), scan.get("take_profit"))
         if not sl_ok:
@@ -1994,6 +2027,13 @@ async def chat(payload: dict = Body(...)):
 
         if trade_action.get("stop_loss") is not None and trade_action.get("take_profit") is not None:
             trade_entry_est = await _get_price(trade_symbol)
+            # Same recurring wrong-side SL/TP mistake shows up here too — mirror it
+            # across entry before validating instead of just blocking the trade.
+            fixed_sl, fixed_tp, was_corrected = _autocorrect_sl_tp(
+                trade_action["side"], trade_entry_est, trade_action.get("stop_loss"), trade_action.get("take_profit")
+            )
+            if was_corrected:
+                trade_action["stop_loss"], trade_action["take_profit"] = fixed_sl, fixed_tp
             sl_ok, sl_reason = _validate_sl_tp(trade_action["side"], trade_entry_est, trade_action.get("stop_loss"), trade_action.get("take_profit"))
             if not sl_ok:
                 reply += f"\n\n⚠️ Didn't place that trade — the SL/TP looked wrong: {sl_reason}"
