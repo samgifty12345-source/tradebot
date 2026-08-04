@@ -4,7 +4,7 @@
 - Sign up at https://metaapi.cloud (free tier = a few accounts)
 - Dashboard → generate an API token
 - This token authenticates YOUR app to MetaApi — it's not the same as your broker/prop firm login
-
+icon
 ## 2. Push to GitHub
 ```
 cd tradeweb
