@@ -347,12 +347,19 @@ def _log_trade_open(*, position_id: str, symbol: str, side: str, volume: float, 
     return record
 
 
+# Tracks when each account's last position closed — used for the post-close
+# cooldown so a leg doesn't immediately re-enter right after being stopped out.
+_last_close_time: Dict[str, datetime] = {"real": None, "demo": None}
+COOLDOWN_SECONDS = int(os.getenv("COOLDOWN_SECONDS", "1800"))  # 30 min
+
+
 def _log_trade_close(position_id: str, actual_pnl):
     for t in reversed(trade_log):
         if t["id"] == position_id and t["status"] == "open":
             t["status"] = "closed"
             t["actual_pnl"] = round(actual_pnl, 2) if actual_pnl is not None else None
             t["closed_time"] = datetime.now(timezone.utc).isoformat()
+            _last_close_time[t.get("account", "demo")] = datetime.now(timezone.utc)
             return t
     return None
 
@@ -815,6 +822,15 @@ async def _run_trade_leg(*, label: str, provider: str, positions: list, pairs_da
         entry.update({"status": "skipped", "reason": f"{open_count} open {label} position(s), max is {MAX_OPEN_POSITIONS}"})
         return entry
 
+    cooldown_key = "real" if label == "real" else "demo"
+    last_close = _last_close_time.get(cooldown_key)
+    if last_close:
+        elapsed = (datetime.now(timezone.utc) - last_close).total_seconds()
+        if elapsed < COOLDOWN_SECONDS:
+            remaining_min = int((COOLDOWN_SECONDS - elapsed) / 60) + 1
+            entry.update({"status": "skipped", "reason": f"Cooldown active on {label} — {remaining_min} min left since last close"})
+            return entry
+
     scan = await _ask_single_ai_scan(provider, pairs_data, news_context)
     entry["scanned"] = scan.get("scanned", {})
 
@@ -875,6 +891,20 @@ async def _run_trade_leg(*, label: str, provider: str, positions: list, pairs_da
             "reason": f"Price moved {moved_pct:.3f}% (>{PRICE_STALENESS_PCT}%) between decision and execution — stale, skipped",
         })
         return entry
+
+    # R:R auto-correction — instead of discarding a setup that falls short of the
+    # minimum ratio, push the take-profit out to meet it. Stop-loss is left alone
+    # (it represents the invalidation point — tightening it to fake a better ratio
+    # would just mean getting stopped out by normal noise more often).
+    sl, tp = scan.get("stop_loss"), scan.get("take_profit")
+    if price_now and sl and tp:
+        risk = abs(price_now - sl)
+        reward = abs(tp - price_now)
+        if risk > 0 and reward / risk < MIN_RISK_REWARD:
+            direction = 1 if action == "buy" else -1
+            new_tp = round(price_now + direction * risk * MIN_RISK_REWARD, 5)
+            scan["take_profit"] = new_tp
+            scan["reason"] = (scan.get("reason", "") + f" [TP auto-adjusted from {tp} to {new_tp} to meet {MIN_RISK_REWARD}:1 R:R minimum]").strip()
 
     volume = _smart_volume(best_symbol, confidence, entry_price=price_now, sl=scan.get("stop_loss"))
     volume = _enforce_min_lot(best_symbol, round(volume * _current_lot_scale(), 2))
@@ -1220,10 +1250,23 @@ async def _call_llm_chat(system: str, history: list, message: str, timeout=60) -
 # so the trading AI and chat AI's combined findings get a third perspective.
 deepseek_review = {"time": None, "text": None}
 
+# Exactly what was sent to the AI on the last real/sim scan — candles, SMA/RSI,
+# per pair/timeframe — so you can inspect what it actually saw, not just what it decided.
+_last_scan_debug: Dict[str, dict] = {"real": None, "sim": None}
+
+
+@app.get("/api/last-scan-data")
+async def get_last_scan_data():
+    """Raw input data the AI was given on its most recent real-leg and sim-leg
+    scans — candles/SMA/RSI per pair per timeframe. Use this to check whether
+    the AI's SL/TP picks actually line up with real recent highs/lows."""
+    return _last_scan_debug
+
 # Live status of the current scan cycle — polled by the frontend to show a "thinking" indicator.
 autotrade_status = {"state": "idle", "since": None, "note": None}
 
 PRICE_STALENESS_PCT = float(os.getenv("PRICE_STALENESS_PCT", "0.15"))  # abort trade if price moved >0.15% since scan
+MIN_RISK_REWARD = float(os.getenv("MIN_RISK_REWARD", "1.5"))  # TP auto-extended to meet this if the AI's setup falls short
 
 DEEPSEEK_VERDICT_PROMPT = """You are the second seat on a two-AI trading council. The lead AI just
 finished a scan cycle and wants to act on this decision:
@@ -1540,12 +1583,14 @@ async def _ask_real_leg_scan(pairs_data: dict, news_context: str = "not checked 
     budget spent, API error, timeout — Groq's independent read is used instead so
     the real account doesn't just sit idle. This never touches the sim leg."""
     candles_per_tf = 8
+    compact = _compact_for_prompt(pairs_data, candles_per_tf)
+    _last_scan_debug["real"] = {"time": datetime.now(timezone.utc).isoformat(), "data": compact, "news_context": news_context}
     prompt = SCAN_PROMPT.format(
         risk_notes=settings["risk_notes"] or "No specific preferences stated — use conservative default risk management.",
         min_confidence=MIN_CONFIDENCE,
         news_context=news_context,
         candles_per_tf=candles_per_tf,
-        pairs_json=json.dumps(_compact_for_prompt(pairs_data, candles_per_tf)),
+        pairs_json=json.dumps(compact),
     )
 
     if _gemini_scan_budget_available():
@@ -1566,12 +1611,14 @@ async def _ask_sim_leg_scan(pairs_data: dict, news_context: str = "not checked t
     """Sim (paper-trading) account: always Groq, fully independent of the real leg —
     no fallback to Gemini, no dependency on Gemini's daily budget."""
     candles_per_tf = 8
+    compact = _compact_for_prompt(pairs_data, candles_per_tf)
+    _last_scan_debug["sim"] = {"time": datetime.now(timezone.utc).isoformat(), "data": compact, "news_context": news_context}
     prompt = SCAN_PROMPT.format(
         risk_notes=settings["risk_notes"] or "No specific preferences stated — use conservative default risk management.",
         min_confidence=MIN_CONFIDENCE,
         news_context=news_context,
         candles_per_tf=candles_per_tf,
-        pairs_json=json.dumps(_compact_for_prompt(pairs_data, candles_per_tf)),
+        pairs_json=json.dumps(compact),
     )
     result = await _raw_scan_call("Groq", _call_groq_raw, prompt, "sim")
     result.pop("_failed", None)
