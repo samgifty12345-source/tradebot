@@ -1474,6 +1474,77 @@ async def _ask_gemini_scan(pairs_data: dict, news_context: str = "not checked th
     }
 
 
+async def _raw_scan_call(name: str, fn, prompt: str, tag: str) -> dict:
+    """One provider's scan call — never raises, always returns a usable dict
+    (hold, with a reason, on any failure) so callers don't need their own
+    try/except around every call site."""
+    try:
+        text = _clean_json_text(await fn(prompt, timeout=90))
+        data = json.loads(text)
+    except Exception as e:
+        _log_conversation(name, f"[{tag}] (failed: {str(e)[:200]})")
+        return {"action": "hold", "best_symbol": None, "confidence": 0,
+                "reason": f"{name} call failed: {str(e)[:200]}", "scanned": {}, "_failed": True}
+
+    action = data.get("action", "hold")
+    if action in ("buy", "sell"):
+        _log_conversation(name, f"[{tag}] I like {action.upper()} {data.get('best_symbol')} at {data.get('confidence', 0)}% — {data.get('reason', '')[:200]}")
+    else:
+        _log_conversation(name, f"[{tag}] Nothing worth taking right now. {data.get('reason', '')[:200]}")
+    return data
+
+
+async def _ask_real_leg_scan(pairs_data: dict, news_context: str = "not checked this run") -> dict:
+    """Real MT5 demo account: Gemini decides. If Gemini can't answer — daily scan
+    budget spent, API error, timeout — Groq's independent read is used instead so
+    the real account doesn't just sit idle. This never touches the sim leg."""
+    candles_per_tf = 15
+    prompt = SCAN_PROMPT.format(
+        risk_notes=settings["risk_notes"] or "No specific preferences stated — use conservative default risk management.",
+        min_confidence=MIN_CONFIDENCE,
+        news_context=news_context,
+        candles_per_tf=candles_per_tf,
+        pairs_json=json.dumps(_compact_for_prompt(pairs_data, candles_per_tf)),
+    )
+
+    if _gemini_scan_budget_available():
+        _bump_gemini_scan_count()
+        result = await _raw_scan_call("Gemini", _call_gemini_raw, prompt, "real")
+        if not result.pop("_failed", False):
+            return result
+        _log_conversation("Gemini", "[real] Falling back to Groq's read for the real account.")
+    else:
+        _log_conversation("Gemini", f"[real] Sitting this one out — daily auto-scan budget ({GEMINI_DAILY_SCAN_BUDGET}) spent. Falling back to Groq's read for the real account.")
+
+    result = await _raw_scan_call("Groq", _call_groq_raw, prompt, "real fallback")
+    result.pop("_failed", None)
+    return result
+
+
+async def _ask_sim_leg_scan(pairs_data: dict, news_context: str = "not checked this run") -> dict:
+    """Sim (paper-trading) account: always Groq, fully independent of the real leg —
+    no fallback to Gemini, no dependency on Gemini's daily budget."""
+    candles_per_tf = 15
+    prompt = SCAN_PROMPT.format(
+        risk_notes=settings["risk_notes"] or "No specific preferences stated — use conservative default risk management.",
+        min_confidence=MIN_CONFIDENCE,
+        news_context=news_context,
+        candles_per_tf=candles_per_tf,
+        pairs_json=json.dumps(_compact_for_prompt(pairs_data, candles_per_tf)),
+    )
+    result = await _raw_scan_call("Groq", _call_groq_raw, prompt, "sim")
+    result.pop("_failed", None)
+    return result
+
+
+async def _ask_single_ai_scan(provider: str, pairs_data: dict, news_context: str = "not checked this run") -> dict:
+    """Dispatcher used by _run_trade_leg: 'gemini' -> real leg (Gemini w/ Groq
+    fallback), anything else (e.g. 'groq') -> sim leg (Groq only)."""
+    if provider == "gemini":
+        return await _ask_real_leg_scan(pairs_data, news_context)
+    return await _ask_sim_leg_scan(pairs_data, news_context)
+
+
 STRATEGY_PROMPT = """You are a disciplined ICT / Smart Money Concepts forex and gold trader.
 You will be given the most recent {n} candles for {symbol} on the {interval} timeframe,
 oldest first, as JSON: [{{time, open, high, low, close}}, ...].
@@ -1685,11 +1756,7 @@ async def _autotrade_scheduler_loop():
     while True:
         await asyncio.sleep(_current_scan_interval())
         try:
-            await _manage_real_positions()
-        except Exception as e:
-            print(f"[scheduler] real position management failed: {e}")
-        try:
-            await _run_autotrade_sim()
+            await _run_autotrade_cycle()  # handles both real (Gemini) and sim (Groq) legs, plus position management for both
         except Exception as e:
             print(f"[scheduler] autotrade cycle failed: {e}")
 
