@@ -67,6 +67,45 @@ async def _connect_account(login: str, password: str, server: str, platform: str
     return account.id, connection
 
 
+# In-memory connect status for the polling flow below — /api/connect used to be
+# one long-held request through Railway's edge proxy, which times out and returns
+# plain-text "upstream error" before the (slow, first-time) MetaApi deploy+sync
+# finishes. Now the connect runs in the background and the frontend polls this.
+_connect_status: Dict[str, dict] = {}  # request_id -> {"state": "connecting"|"connected"|"error", "accountId": str|None, "error": str|None}
+
+
+async def _do_connect(request_id: str, login: str, password: str, server: str, platform: str):
+    try:
+        account_id, _ = await _connect_account(login, password, server, platform)
+        _connect_status[request_id] = {"state": "connected", "accountId": account_id, "error": None}
+    except Exception as e:
+        _connect_status[request_id] = {"state": "error", "accountId": None, "error": str(e)[:300]}
+
+
+@app.post("/api/connect-start")
+async def connect_start(payload: dict = Body(...), background_tasks: BackgroundTasks = None):
+    login = payload.get("login")
+    password = payload.get("password")
+    server = payload.get("server")
+    platform = payload.get("platform", "mt5")
+
+    if not all([login, password, server]):
+        raise HTTPException(400, "login, password, server are required")
+
+    request_id = uuid.uuid4().hex[:12]
+    _connect_status[request_id] = {"state": "connecting", "accountId": None, "error": None}
+    background_tasks.add_task(_do_connect, request_id, login, password, server, platform)
+    return {"requestId": request_id}
+
+
+@app.get("/api/connect-status/{request_id}")
+async def connect_status(request_id: str):
+    status = _connect_status.get(request_id)
+    if not status:
+        raise HTTPException(404, "Unknown requestId")
+    return status
+
+
 @app.post("/api/connect")
 async def connect(payload: dict = Body(...)):
     login = payload.get("login")
