@@ -982,6 +982,8 @@ async def _run_autotrade_cycle():
                          "reason": "MT_LOGIN/MT_PASSWORD/MT_SERVER not set — real leg disabled"})
 
     autotrade_status["note"] = "Groq analyzing sim-account setups..."
+    if real_available:
+        await asyncio.sleep(5)  # give the Groq TPM window room if real's leg just used a fallback call
     results.append(await _run_trade_leg(
         label="sim", provider="groq", positions=sim_positions, pairs_data=pairs_data,
         news_context=news_context, entry_base=entry_base, get_price=_get_price,
@@ -1444,7 +1446,7 @@ async def _ask_gemini_scan(pairs_data: dict, news_context: str = "not checked th
     if not GEMINI_API_KEY and not GROQ_API_KEY:
         raise HTTPException(500, "Neither GEMINI_API_KEY nor GROQ_API_KEY is set on the server")
 
-    candles_per_tf = 15
+    candles_per_tf = 8
     prompt = SCAN_PROMPT.format(
         risk_notes=settings["risk_notes"] or "No specific preferences stated — use conservative default risk management.",
         min_confidence=MIN_CONFIDENCE,
@@ -1537,7 +1539,7 @@ async def _ask_real_leg_scan(pairs_data: dict, news_context: str = "not checked 
     """Real MT5 demo account: Gemini decides. If Gemini can't answer — daily scan
     budget spent, API error, timeout — Groq's independent read is used instead so
     the real account doesn't just sit idle. This never touches the sim leg."""
-    candles_per_tf = 15
+    candles_per_tf = 8
     prompt = SCAN_PROMPT.format(
         risk_notes=settings["risk_notes"] or "No specific preferences stated — use conservative default risk management.",
         min_confidence=MIN_CONFIDENCE,
@@ -1563,7 +1565,7 @@ async def _ask_real_leg_scan(pairs_data: dict, news_context: str = "not checked 
 async def _ask_sim_leg_scan(pairs_data: dict, news_context: str = "not checked this run") -> dict:
     """Sim (paper-trading) account: always Groq, fully independent of the real leg —
     no fallback to Gemini, no dependency on Gemini's daily budget."""
-    candles_per_tf = 15
+    candles_per_tf = 8
     prompt = SCAN_PROMPT.format(
         risk_notes=settings["risk_notes"] or "No specific preferences stated — use conservative default risk management.",
         min_confidence=MIN_CONFIDENCE,
