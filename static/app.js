@@ -93,9 +93,11 @@ function initCombo(inputId, listId, onSelect) {
 }
 
 let accountId = localStorage.getItem("accountId");
-if (accountId === "SIM") {
-  // Stale value from before the built-in simulator was removed — it's not a
-  // real MetaApi account id, so hitting /api/account/SIM etc. would just 404.
+if (!accountId || accountId === "SIM" || accountId === "null" || accountId === "undefined") {
+  // Any of these are stale/invalid — "SIM" is the removed simulator's old
+  // sentinel, and "null"/"undefined" happen if a connect attempt somehow
+  // stored a bad value. None of them are a real MetaApi account id, so
+  // hitting /api/account/<that> would just 404 and immediately log back out.
   localStorage.removeItem("accountId");
   accountId = null;
 }
@@ -109,6 +111,11 @@ async function pollConnectStatus(requestId, statusPrefix) {
     const data = await res.json();
 
     if (data.state === "connected") {
+      if (!data.accountId) {
+        // Shouldn't happen, but guard against ever caching a bad value again
+        document.getElementById("login-status").innerText = "Connected but no account id was returned — try again, and check Railway logs.";
+        return;
+      }
       accountId = data.accountId;
       localStorage.setItem("accountId", accountId);
       showDashboard();
