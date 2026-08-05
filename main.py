@@ -31,6 +31,45 @@ app.add_middleware(
 # accountId -> live RPC connection (in-memory; fine for single-user/dev use)
 connections: Dict[str, object] = {}
 
+# accountId -> "real" | "demo" — set whenever we connect, by matching the login
+# used against MT_LOGIN/MT2_LOGIN. Lets generic account_id-keyed endpoints
+# (e.g. /api/trade/{account_id}, /api/positions/{account_id}) know which broker
+# they're actually talking to, instead of assuming "real".
+_account_id_labels: Dict[str, str] = {}
+
+# Exness (the "demo" account) suffixes every single symbol with "m" on its side
+# (XAUUSD -> XAUUSDm, EURUSD -> EURUSDm, etc). The rest of this app — watchlist,
+# chart matching, trade log, success-rate lookups — all use the canonical
+# no-suffix names, so we translate at the broker boundary only: append the
+# suffix right before any MetaApi call that takes a symbol for the demo
+# account, and strip it back off any symbol MetaApi hands back to us.
+DEMO_SYMBOL_SUFFIX = os.getenv("DEMO_SYMBOL_SUFFIX", "m")
+
+
+def _to_broker_symbol(symbol: str, account: str) -> str:
+    symbol = (symbol or "").upper()
+    if account == "demo" and DEMO_SYMBOL_SUFFIX and not symbol.endswith(DEMO_SYMBOL_SUFFIX.upper()):
+        return symbol + DEMO_SYMBOL_SUFFIX
+    return symbol
+
+
+def _from_broker_symbol(symbol: str, account: str) -> str:
+    if not symbol:
+        return symbol
+    if account == "demo" and DEMO_SYMBOL_SUFFIX and symbol.upper().endswith(DEMO_SYMBOL_SUFFIX.upper()):
+        return symbol[: -len(DEMO_SYMBOL_SUFFIX)]
+    return symbol
+
+
+async def _get_positions_normalized(conn, label: str) -> list:
+    """get_positions(), but with the broker's symbol names translated back to
+    our canonical (no-suffix) names for the given account label."""
+    positions = await conn.get_positions()
+    for pos in positions:
+        if pos.get("symbol"):
+            pos["symbol"] = _from_broker_symbol(pos["symbol"], label)
+    return positions
+
 
 async def _connect_account(login: str, password: str, server: str, platform: str = "mt5"):
     """Shared connect logic — used by both the manual login and the autotrade loop.
@@ -65,6 +104,10 @@ async def _connect_account(login: str, password: str, server: str, platform: str
     await connection.wait_synchronized()
 
     connections[account.id] = connection
+    if login == MT_LOGIN:
+        _account_id_labels[account.id] = "real"
+    elif login == MT2_LOGIN:
+        _account_id_labels[account.id] = "demo"
     return account.id, connection
 
 
@@ -143,14 +186,16 @@ async def get_account_info(account_id: str):
 @app.get("/api/positions/{account_id}")
 async def get_positions(account_id: str):
     conn = _get_connection(account_id)
-    positions = await conn.get_positions()
+    label = _account_id_labels.get(account_id, "real")
+    positions = await _get_positions_normalized(conn, label)
     return positions
 
 
 @app.get("/api/price/{account_id}/{symbol}")
 async def get_price(account_id: str, symbol: str):
     conn = _get_connection(account_id)
-    price = await conn.get_symbol_price(symbol)
+    label = _account_id_labels.get(account_id, "real")
+    price = await conn.get_symbol_price(_to_broker_symbol(symbol, label))
     return price
 
 
@@ -161,8 +206,14 @@ REAL_UNSUPPORTED_SYMBOLS = {"BTCUSD", "ETHUSD"}  # not offered on the "real" MT5
 
 async def _place_trade(conn, symbol: str, side: str, volume: float, sl=None, tp=None,
                         confidence=None, reason: str = "", source: str = "manual", account: str = "real"):
-    if account == "real" and symbol.upper() in REAL_UNSUPPORTED_SYMBOLS:
+    symbol = (symbol or "").upper()
+    if account == "real" and symbol in REAL_UNSUPPORTED_SYMBOLS:
         raise ValueError(f"{symbol} isn't available on the real MT5 account (demo has no crypto) — skipping real trade")
+
+    # Everything below talks to the broker using broker_symbol (Exness/"demo" needs the
+    # "m" suffix, e.g. XAUUSDm); everything we log/return uses the canonical `symbol`
+    # so the rest of the app (watchlist, trade log, chart) never has to know about it.
+    broker_symbol = _to_broker_symbol(symbol, account)
 
     volume = _enforce_min_lot(symbol, volume)
 
@@ -173,7 +224,7 @@ async def _place_trade(conn, symbol: str, side: str, volume: float, sl=None, tp=
     # real MetaApi-connected broker accounts.
     entry_estimate = None
     try:
-        price_info = await conn.get_symbol_price(symbol)
+        price_info = await conn.get_symbol_price(broker_symbol)
         entry_estimate = price_info.get("ask") if side == "buy" else price_info.get("bid")
     except Exception:
         pass
@@ -190,18 +241,26 @@ async def _place_trade(conn, symbol: str, side: str, volume: float, sl=None, tp=
     if final_tp:
         opts["take_profit"] = float(final_tp)
 
-    if side == "buy":
-        result = await conn.create_market_buy_order(symbol, float(volume), **opts)
-    elif side == "sell":
-        result = await conn.create_market_sell_order(symbol, float(volume), **opts)
-    else:
-        raise HTTPException(400, "side must be 'buy' or 'sell'")
+    try:
+        if side == "buy":
+            result = await conn.create_market_buy_order(broker_symbol, float(volume), **opts)
+        elif side == "sell":
+            result = await conn.create_market_sell_order(broker_symbol, float(volume), **opts)
+        else:
+            raise HTTPException(400, "side must be 'buy' or 'sell'")
+    except HTTPException:
+        raise
+    except Exception as e:
+        # Broker/MetaApi rejections (bad symbol, invalid volume, market closed, etc.)
+        # land here — surface them as a real error instead of letting them bubble up
+        # as an unhandled 500 (which the frontend can't parse as JSON).
+        raise RuntimeError(f"Broker rejected the order for {broker_symbol}: {str(e)[:300]}")
 
     position_id = (result or {}).get("positionId") or (result or {}).get("orderId") or uuid.uuid4().hex[:10]
     entry_price = (result or {}).get("price") or entry_estimate
     if entry_price is None:
         try:
-            price_info = await conn.get_symbol_price(symbol)
+            price_info = await conn.get_symbol_price(broker_symbol)
             entry_price = price_info.get("ask") if side == "buy" else price_info.get("bid")
         except Exception:
             entry_price = None
@@ -230,13 +289,32 @@ async def place_trade(account_id: str, payload: dict = Body(...)):
     if not all([symbol, side, volume]):
         raise HTTPException(400, "symbol, side, volume are required")
 
-    return await _place_trade(conn, symbol, side, volume, sl, tp, source="manual", account="real")
+    # This used to hardcode account="real" no matter which account_id was actually
+    # connected — meaning trades placed against the Exness demo account still went
+    # through as if they were "real" (wrong symbol suffix, wrong bucket for the hard
+    # SL/TP tracking). Look up which account this connection actually is instead.
+    label = _account_id_labels.get(account_id, "real")
+
+    try:
+        return await _place_trade(conn, symbol, side, volume, sl, tp, source="manual", account=label)
+    except ValueError as e:
+        # e.g. crypto attempted on the real account
+        raise HTTPException(400, str(e))
+    except HTTPException:
+        raise
+    except Exception as e:
+        # Never let a raw broker exception escape as a non-JSON 500 — the frontend
+        # expects `await res.json()` to succeed even on failure.
+        raise HTTPException(502, f"Trade failed: {str(e)[:300]}")
 
 
 @app.post("/api/close/{account_id}/{position_id}")
 async def close_position(account_id: str, position_id: str):
     conn = _get_connection(account_id)
-    result = await conn.close_position(position_id)
+    try:
+        result = await conn.close_position(position_id)
+    except Exception as e:
+        raise HTTPException(502, f"Close failed: {str(e)[:300]}")
     pnl = (result or {}).get("profit") if isinstance(result, dict) else None
     if pnl is not None:
         _log_trade_close(position_id, pnl)
@@ -559,7 +637,7 @@ async def _manage_broker_positions(label: str) -> list:
 
     try:
         _, conn = await _connect_account(creds["login"], creds["password"], creds["server"], creds["platform"])
-        positions = await conn.get_positions()
+        positions = await _get_positions_normalized(conn, label)
     except Exception:
         return closed  # connection/fetch failed — leave positions alone, try again next cycle
 
@@ -1021,7 +1099,7 @@ async def _run_autotrade_cycle():
         try:
             _, real_conn = await _connect_account(MT_LOGIN, MT_PASSWORD, MT_SERVER, MT_PLATFORM)
             closed = await _manage_broker_positions("real")
-            real_positions = await real_conn.get_positions()
+            real_positions = await _get_positions_normalized(real_conn, "real")
             if closed:
                 entry_base["real_closed"] = closed
         except Exception as e:
@@ -1039,7 +1117,7 @@ async def _run_autotrade_cycle():
         try:
             _, demo_conn = await _connect_account(demo_creds["login"], demo_creds["password"], demo_creds["server"], demo_creds["platform"])
             closed = await _manage_broker_positions("demo")
-            demo_positions = await demo_conn.get_positions()
+            demo_positions = await _get_positions_normalized(demo_conn, "demo")
             if closed:
                 entry_base["demo_closed"] = closed
         except Exception as e:
@@ -1817,7 +1895,7 @@ async def _run_autotrade():
         if closed:
             entry["closed"] = closed
 
-        positions = await conn.get_positions()
+        positions = await _get_positions_normalized(conn, "real")
         if len(positions) >= MAX_OPEN_POSITIONS:
             entry.update({"status": "skipped", "reason": f"{len(positions)} open position(s), max is {MAX_OPEN_POSITIONS}"})
             autotrade_log.append(entry)
@@ -2160,7 +2238,7 @@ async def _live_data_snapshot():
         try:
             _, conn = await _connect_account(MT_LOGIN, MT_PASSWORD, MT_SERVER, MT_PLATFORM)
             info = await conn.get_account_information()
-            positions = await conn.get_positions()
+            positions = await _get_positions_normalized(conn, "real")
             parts.append(f"Real account balance: {info.get('balance')} {info.get('currency')}, equity: {info.get('equity')}")
             if positions:
                 pos_desc = ", ".join(f"{p['symbol']} {p['type']} {p['volume']} lots (P/L {p['profit']})" for p in positions)
@@ -2176,7 +2254,7 @@ async def _live_data_snapshot():
         try:
             _, dconn = await _connect_account(MT2_LOGIN, MT2_PASSWORD, MT2_SERVER, MT2_PLATFORM)
             dinfo = await dconn.get_account_information()
-            dpositions = await dconn.get_positions()
+            dpositions = await _get_positions_normalized(dconn, "demo")
             parts.append(f"Demo (Exness) account balance: {dinfo.get('balance')} {dinfo.get('currency')}, equity: {dinfo.get('equity')}")
             if dpositions:
                 dpos_desc = ", ".join(f"{p['symbol']} {p['type']} {p['volume']} lots (P/L {p['profit']})" for p in dpositions)
@@ -2322,7 +2400,7 @@ async def chat(payload: dict = Body(...)):
                 continue
             try:
                 _, conn = await _connect_account(creds["login"], creds["password"], creds["server"], creds["platform"])
-                positions = await conn.get_positions()
+                positions = await _get_positions_normalized(conn, label)
                 for pos in positions:
                     if target_symbol and pos.get("symbol", "").upper() != target_symbol:
                         continue
