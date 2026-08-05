@@ -8,6 +8,7 @@ let lastFormattedCandles = [];
 let lastBoundaryMarkers = [];
 let lastPositionMarkers = [];
 let lastPositionsForMarkers = [];
+let entryPointSeries = []; // dedicated price-anchored series per open position — markers can't be placed at an exact price, so this replaces that approach
 
 // ---------- Searchable pair dropdown ----------
 
@@ -379,33 +380,59 @@ function findNearestCandleTime(entryTimeSec) {
   return chosen;
 }
 
-function computeEntryMarkers(positions, chartSymbol) {
-  if (!lastFormattedCandles.length) return [];
-  const markers = [];
+function clearEntryPointSeries() {
+  if (!chart) return;
+  entryPointSeries.forEach((s) => {
+    try { chart.removeSeries(s); } catch (e) { /* already gone */ }
+  });
+  entryPointSeries = [];
+}
+
+function drawEntryPoints(positions, chartSymbol) {
+  clearEntryPointSeries();
+  if (!chart || !lastFormattedCandles.length) return;
+
   positions.forEach((p) => {
     if (p.symbol !== chartSymbol) return;
     const openIso = p.open_time || p.time || p.openTime;
-    if (!openIso) return;
+    const entryPrice = p.entry_price || p.entry || p.open_price;
+    if (!openIso || entryPrice == null) return;
+
     const entrySec = Math.floor(new Date(openIso).getTime() / 1000);
     if (isNaN(entrySec)) return;
     const snapped = findNearestCandleTime(entrySec);
     if (snapped === null) return;
+
     const side = (p.side || p.type || "").toLowerCase();
     const isBuy = side.includes("buy");
-    markers.push({
-      time: snapped,
-      position: "inBar",
+
+    // A single-point line series with markers on, but no line drawn — this is
+    // the only way in Lightweight Charts to anchor a dot to an exact PRICE
+    // (setMarkers only positions relative to the bar, never at a price value,
+    // which is why the old dot never lined up with the entry line).
+    const series = chart.addLineSeries({
+      lineVisible: false,
+      pointMarkersVisible: true,
+      pointMarkersRadius: 5,
       color: isBuy ? "#2f6dff" : "#f5a623",
-      shape: "circle",
-      size: 1,
+      lastValueVisible: false,
+      priceLineVisible: false,
+      crosshairMarkerVisible: false,
     });
+    series.setData([{ time: snapped, value: Number(entryPrice) }]);
+    entryPointSeries.push(series);
   });
-  return markers;
+}
+
+function computeEntryMarkers(positions, chartSymbol) {
+  // Boundary/day markers still use the library's marker system (text labels,
+  // not price-critical) — entry dots are now handled by drawEntryPoints instead.
+  return [];
 }
 
 function applyChartMarkers() {
   if (!candleSeries) return;
-  const merged = [...lastBoundaryMarkers, ...lastPositionMarkers].sort((a, b) => a.time - b.time);
+  const merged = [...lastBoundaryMarkers].sort((a, b) => a.time - b.time);
   candleSeries.setMarkers(merged);
 }
 
