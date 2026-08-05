@@ -154,7 +154,9 @@ async def get_price(account_id: str, symbol: str):
     return price
 
 
-REAL_UNSUPPORTED_SYMBOLS = {"BTCUSD", "ETHUSD"}  # not offered on this MT5 demo — real orders for these always fail
+REAL_UNSUPPORTED_SYMBOLS = {"BTCUSD", "ETHUSD"}  # not offered on the "real" MT5 account — real orders for these always fail there.
+# NOTE: this restriction is scoped to account == "real" only. The "demo" account is now the
+# live Exness account, which DOES support crypto, so BTCUSD/ETHUSD are allowed there.
 
 
 async def _place_trade(conn, symbol: str, side: str, volume: float, sl=None, tp=None,
@@ -167,6 +169,8 @@ async def _place_trade(conn, symbol: str, side: str, volume: float, sl=None, tp=
     # Estimate entry price up front so a real broker-side SL/TP can be attached
     # at order time — this makes the $ profit/loss cap the BROKER's job, closing
     # the position instantly, instead of depending on the bot polling afterward.
+    # Applies to BOTH live accounts now ("real" and "demo"/Exness) since both are
+    # real MetaApi-connected broker accounts.
     entry_estimate = None
     try:
         price_info = await conn.get_symbol_price(symbol)
@@ -176,7 +180,7 @@ async def _place_trade(conn, symbol: str, side: str, volume: float, sl=None, tp=
 
     final_sl = float(sl) if sl else None
     final_tp = float(tp) if tp else None
-    if entry_estimate and account == "real":
+    if entry_estimate and account in ("real", "demo"):
         final_sl = _price_for_usd_pnl(symbol, side, entry_estimate, volume, -HARD_LOSS_CLOSE_USD)
         final_tp = _price_for_usd_pnl(symbol, side, entry_estimate, volume, HARD_PROFIT_CLOSE_USD)
 
@@ -202,8 +206,8 @@ async def _place_trade(conn, symbol: str, side: str, volume: float, sl=None, tp=
         except Exception:
             entry_price = None
 
-    if account == "real":
-        _tracked_real_positions[position_id] = {"symbol": symbol, "side": side, "sl": final_sl, "tp": final_tp}
+    if account in ("real", "demo"):
+        _tracked_positions[account][position_id] = {"symbol": symbol, "side": side, "sl": final_sl, "tp": final_tp}
 
     if entry_price is not None:
         _log_trade_open(
@@ -306,14 +310,16 @@ async def get_chart(symbol: str, interval: str = "5min", outputsize: int = 100):
     return {"symbol": symbol.upper(), "candles": candles}
 
 
-# ---------------- Built-in simulated demo account (no MetaApi needed) ----------------
+# ---------------- Live price cache ----------------
+# The built-in simulated demo account has been removed — the "demo" account is now the
+# live Exness account below, connected via MetaApi like the "real" account. This cache is
+# still used generally by _get_price() for staleness checks, P/L math, etc.
 
-sim_account = {"balance": 5000.0, "positions": []}  # positions: list of dicts
 _price_cache: Dict[str, tuple] = {}  # symbol -> (timestamp, price)
 PRICE_CACHE_TTL = 30  # seconds
 
 # ---------------- Unified trade log ----------------
-# Every trade — manual, chat-triggered, or auto-traded, real or demo — is logged
+# Every trade — manual, chat-triggered, or auto-traded, on either live account — is logged
 # here so the Chat AI and the Auto-Trading AI share one source of truth.
 trade_log = []  # newest last; persisted to GitHub
 
@@ -337,8 +343,8 @@ def _log_trade_open(*, position_id: str, symbol: str, side: str, volume: float, 
         "actual_pnl": None,
         "confidence": confidence,
         "reason": reason,
-        "source": source,  # "manual" | "chat" | "autotrade" | "autotrade-sim"
-        "account": account,  # "real" | "demo"
+        "source": source,  # "manual" | "chat" | "autotrade"
+        "account": account,  # "real" | "demo"  (both are live MetaApi accounts now)
         "status": "open",
     }
     trade_log.append(record)
@@ -366,11 +372,11 @@ MAX_LOSS_USD = float(os.getenv("MAX_LOSS_USD", "300"))
 PROFIT_TARGET_USD = float(os.getenv("PROFIT_TARGET_USD", "300"))
 
 # Hard $ auto-close thresholds — enforced for BOTH the real and demo accounts,
-# independent of the AI momentum-management above. No AI judgment call here:
-# the instant floating P/L crosses either line, the position is closed. For the
-# REAL account this is attached as an actual broker-side SL/TP order at trade
-# open time (see _place_trade / _price_for_usd_pnl below), so it fires instantly
-# without needing the bot to poll and notice.
+# independent of any AI momentum-management. No AI judgment call here: the instant
+# floating P/L crosses either line, the position is closed. For BOTH accounts this
+# is attached as an actual broker-side SL/TP order at trade open time (see
+# _place_trade / _price_for_usd_pnl below), so it fires instantly without needing
+# the bot to poll and notice.
 HARD_PROFIT_CLOSE_USD = float(os.getenv("HARD_PROFIT_CLOSE_USD", "100"))
 HARD_LOSS_CLOSE_USD = float(os.getenv("HARD_LOSS_CLOSE_USD", "50"))
 
@@ -386,10 +392,10 @@ CAUTIOUS_LOT_SCALE = float(os.getenv("CAUTIOUS_LOT_SCALE", "0.3"))  # 30% of the
 
 _daily_trade_state = {"date": None, "wins": 0, "losses": 0, "mode": "normal"}
 
-# id -> {symbol, side, sl, tp} for real positions opened with a hard-cap broker
-# SL/TP, so _manage_real_positions can tell whether a position that vanished
-# between polls was closed by hitting the profit side or the loss side.
-_tracked_real_positions: Dict[str, dict] = {}
+# label ("real"/"demo") -> {position_id: {symbol, side, sl, tp}} for positions opened
+# with a hard-cap broker SL/TP, so _manage_broker_positions can tell whether a position
+# that vanished between polls was closed by hitting the profit side or the loss side.
+_tracked_positions: Dict[str, Dict[str, dict]] = {"real": {}, "demo": {}}
 
 
 def _reset_daily_trade_state_if_needed():
@@ -513,81 +519,17 @@ async def _get_price(symbol: str) -> float:
     return price
 
 
-def _sim_pnl(position: dict, current_price: float) -> float:
-    return _calc_pnl_dollars(position["symbol"], position["side"], position["entry_price"], current_price, position["volume"])
-
-
-@app.post("/api/sim/reset")
-async def reset_sim_account():
-    sim_account["balance"] = 5000.0
-    sim_account["positions"] = []
-    await _github_save_state()
-    return {"status": "reset", "balance": sim_account["balance"]}
-
-
-@app.get("/api/sim/account")
-async def sim_account_info():
-    total_pnl = 0.0
-    for p in sim_account["positions"]:
-        price = await _get_price(p["symbol"])
-        total_pnl += _sim_pnl(p, price)
-    return {"balance": round(sim_account["balance"], 2), "equity": round(sim_account["balance"] + total_pnl, 2), "currency": "USD"}
-
-
-@app.get("/api/sim/positions")
-async def sim_positions():
-    result = []
-    for p in sim_account["positions"]:
-        price = await _get_price(p["symbol"])
-        pnl = _sim_pnl(p, price)
-        result.append({**p, "profit": round(pnl, 2), "type": p["side"]})
-    return result
-
-
-@app.post("/api/sim/trade")
-async def sim_trade(payload: dict = Body(...)):
-    symbol = (payload.get("symbol") or "").upper()
-    side = payload.get("side")
-    volume = _enforce_min_lot(symbol, payload.get("volume") or 0.01)
-    sl = payload.get("sl")
-    tp = payload.get("tp")
-
-    if not symbol or side not in ("buy", "sell"):
-        raise HTTPException(400, "symbol and a valid side (buy/sell) are required")
-
-    price = await _get_price(symbol)
-    pos = {
-        "id": uuid.uuid4().hex[:10],
-        "symbol": symbol,
-        "side": side,
-        "volume": volume,
-        "entry_price": price,
-        "sl": float(sl) if sl else None,
-        "tp": float(tp) if tp else None,
-        "open_time": datetime.now(timezone.utc).isoformat(),
-    }
-    sim_account["positions"].append(pos)
-    _log_trade_open(
-        position_id=pos["id"], symbol=symbol, side=side, volume=volume, entry=price,
-        sl=pos["sl"], tp=pos["tp"], confidence=payload.get("confidence"),
-        reason=payload.get("reason", ""), source=payload.get("source", "manual"), account="demo",
-    )
-    await _github_save_state()
-    return pos
-
-
-@app.post("/api/sim/close/{position_id}")
-async def sim_close(position_id: str):
-    pos = next((p for p in sim_account["positions"] if p["id"] == position_id), None)
-    if not pos:
-        raise HTTPException(404, "Position not found")
-    price = await _get_price(pos["symbol"])
-    pnl = _sim_pnl(pos, price)
-    sim_account["balance"] += pnl
-    sim_account["positions"].remove(pos)
-    _log_trade_close(position_id, pnl)
-    await _github_save_state()
-    return {"closed": True, "pnl": round(pnl, 2)}
+def _symbol_success_rate(symbol: str, account: str = None, min_trades: int = 1):
+    """Win rate (0-100) for a symbol from CLOSED trades in the unified trade log.
+    Returns None if there isn't enough closed-trade history yet to judge — callers
+    should treat None as 'no data', not as a 0% rate."""
+    trades = [t for t in trade_log if t["symbol"] == symbol and t["status"] == "closed" and t.get("actual_pnl") is not None]
+    if account:
+        trades = [t for t in trades if t.get("account") == account]
+    if len(trades) < min_trades:
+        return None
+    wins = sum(1 for t in trades if t["actual_pnl"] > 0)
+    return round(100 * wins / len(trades), 1)
 
 
 MANAGE_PROMPT = """You are managing an open {side} position on {symbol}, opened at {entry_price}.
@@ -603,91 +545,34 @@ Respond with ONLY raw JSON: {{"close": true|false, "reason": "one short sentence
 """
 
 
-async def _ask_manage_gemini(pos: dict, candles: list, pnl: float) -> dict:
-    prompt = MANAGE_PROMPT.format(
-        side=pos["side"], symbol=pos["symbol"], entry_price=pos["entry_price"], pnl=pnl,
-        max_loss=MAX_LOSS_USD, profit_target=PROFIT_TARGET_USD,
-        interval=settings["interval"], candles_json=json.dumps(candles),
-    )
-    try:
-        text = await _call_llm_text(prompt, timeout=60)
-        return json.loads(_clean_json_text(text))
-    except Exception:
-        return {"close": False, "reason": "management check failed"}
-
-
-async def _manage_sim_positions():
-    """Runs every autotrade-sim cycle before scanning for new trades. Closes
-    positions that hit their actual SL/TP price level, the $ stop/target, or
-    that the AI judges to be losing momentum even before hitting those limits."""
+async def _manage_broker_positions(label: str) -> list:
+    """Safety-net + tracking for a live MetaApi account ("real" or "demo"/Exness). The
+    hard $ profit/loss cap is normally enforced instantly by the broker-side SL/TP order
+    attached when the trade was opened (see _place_trade) — this function (a) catches any
+    position the broker didn't close for some reason (e.g. it rejected the exact SL/TP
+    distance), and (b) notices positions the broker already closed on its own so the daily
+    win/loss streak counters stay accurate."""
     closed = []
-    for pos in list(sim_account["positions"]):
-        price = await _get_price(pos["symbol"])
-        pnl = _sim_pnl(pos, price)
-
-        hit_sl = pos.get("sl") is not None and (
-            (pos["side"] == "buy" and price <= pos["sl"]) or (pos["side"] == "sell" and price >= pos["sl"])
-        )
-        hit_tp = pos.get("tp") is not None and (
-            (pos["side"] == "buy" and price >= pos["tp"]) or (pos["side"] == "sell" and price <= pos["tp"])
-        )
-        hit_hard_profit = pnl >= HARD_PROFIT_CLOSE_USD
-        hit_hard_loss = pnl <= -HARD_LOSS_CLOSE_USD
-
-        if hit_hard_profit or hit_hard_loss:
-            reason = f"Hit hard profit close (${pnl:.2f} >= ${HARD_PROFIT_CLOSE_USD})" if hit_hard_profit else \
-                     f"Hit hard stop loss close (${pnl:.2f} <= -${HARD_LOSS_CLOSE_USD})"
-            result = await sim_close(pos["id"])
-            _record_hard_close(hit_hard_profit)
-            closed.append({"symbol": pos["symbol"], "reason": reason, "pnl": result["pnl"]})
-            continue
-
-        if hit_sl or hit_tp or pnl <= -MAX_LOSS_USD or pnl >= PROFIT_TARGET_USD:
-            reason = ("Hit stop loss price level" if hit_sl else
-                      "Hit take profit price level" if hit_tp else
-                      f"Hit {'stop loss' if pnl < 0 else 'profit target'} (${pnl:.2f})")
-            result = await sim_close(pos["id"])
-            closed.append({"symbol": pos["symbol"], "reason": reason, "pnl": result["pnl"]})
-            continue
-
-        try:
-            candles = await _fetch_candles(pos["symbol"], interval=settings["interval"], outputsize=20)
-            decision = await _ask_manage_gemini(pos, candles, pnl)
-            if decision.get("close"):
-                result = await sim_close(pos["id"])
-                closed.append({"symbol": pos["symbol"], "reason": decision.get("reason", "AI judged momentum was fading"), "pnl": result["pnl"]})
-        except Exception:
-            pass  # leave position open if the check itself fails
-
-    return closed
-
-
-async def _manage_real_positions():
-    """Safety-net + tracking for the REAL MetaApi account. The hard $ profit/loss
-    cap is normally enforced instantly by the broker-side SL/TP order attached
-    when the trade was opened (see _place_trade) — this function (a) catches any
-    position the broker didn't close for some reason (e.g. it rejected the exact
-    SL/TP distance), and (b) notices positions the broker already closed on its
-    own so the daily win/loss streak counters stay accurate."""
-    closed = []
-    if not all([MT_LOGIN, MT_PASSWORD, MT_SERVER]):
+    creds = ACCOUNTS.get(label)
+    if not creds or not all([creds["login"], creds["password"], creds["server"]]):
         return closed
 
     try:
-        _, conn = await _connect_account(MT_LOGIN, MT_PASSWORD, MT_SERVER, MT_PLATFORM)
+        _, conn = await _connect_account(creds["login"], creds["password"], creds["server"], creds["platform"])
         positions = await conn.get_positions()
     except Exception:
         return closed  # connection/fetch failed — leave positions alone, try again next cycle
 
     open_ids = {pos["id"] for pos in positions}
+    tracked = _tracked_positions[label]
 
     # Anything we were tracking that's no longer open was closed by the broker's
     # own SL/TP order already. Figure out win vs. loss from which target the last
     # known price sat closer to, and count it toward today's streak.
-    for tracked_id in list(_tracked_real_positions.keys()):
+    for tracked_id in list(tracked.keys()):
         if tracked_id in open_ids:
             continue
-        info = _tracked_real_positions.pop(tracked_id)
+        info = tracked.pop(tracked_id)
         try:
             price = await _get_price(info["symbol"])
             dist_to_tp = abs(price - info["tp"]) if info.get("tp") else None
@@ -714,7 +599,7 @@ async def _manage_real_positions():
             await conn.close_position(pos["id"])
             _log_trade_close(pos["id"], pnl)
             _record_hard_close(hit_hard_profit)
-            _tracked_real_positions.pop(pos["id"], None)
+            tracked.pop(pos["id"], None)
             closed.append({"symbol": pos.get("symbol"), "reason": reason, "pnl": pnl})
         except Exception:
             pass  # leave it open if the close call itself fails — retried next cycle
@@ -800,19 +685,11 @@ def _confidence_volume(base_volume: float, confidence: float) -> float:
     return round(base_volume * scale, 2)
 
 
-MANAGE_CHECK_INTERVAL_WHEN_MAXED = int(os.getenv("MANAGE_CHECK_INTERVAL_WHEN_MAXED", "3600"))  # 1 hour
-_last_maxed_check = {"time": None}
-
-
-async def _sim_positions():
-    return list(sim_account["positions"])
-
-
 async def _run_trade_leg(*, label: str, provider: str, positions: list, pairs_data: dict,
                           news_context: str, place_trade, get_price, entry_base: dict) -> dict:
-    """One AI's independent decision + execution against one account (real+Gemini or
-    sim+Groq). Both legs share this exact risk pipeline — stack rules, staleness
-    check, DeepSeek veto — so a future change only has to be made once."""
+    """One AI's independent decision + execution against the 'real' account (Gemini leg).
+    The 'demo'/Exness leg uses _run_demo_leg below instead, since it has its own
+    Groq-first / Gemini-reviews negotiation flow."""
     entry = dict(entry_base)
     entry["account"] = label
 
@@ -858,7 +735,6 @@ async def _run_trade_leg(*, label: str, provider: str, positions: list, pairs_da
         return entry
 
     # Independent sanity check before firing — DeepSeek reviews this AI's decision.
-    # (Not a "must-agree" council anymore: Gemini and Groq each own their own account now.)
     verdict_context = (
         f"[{label}/{provider}] Decision: {action.upper()} {best_symbol}, confidence {confidence}%, "
         f"reason: {scan.get('reason', '')}. Full scan: {json.dumps(scan)[:2000]}"
@@ -875,7 +751,7 @@ async def _run_trade_leg(*, label: str, provider: str, positions: list, pairs_da
         return entry
 
     # Staleness check — re-fetch price right before executing, since the AI call and
-    # DeepSeek review both take real time. Applied to BOTH legs now (previously only sim had it).
+    # DeepSeek review both take real time.
     try:
         price_at_scan = await get_price(best_symbol)
         price_now = await get_price(best_symbol)
@@ -925,11 +801,203 @@ async def _run_trade_leg(*, label: str, provider: str, positions: list, pairs_da
     return entry
 
 
+GROQ_TO_GEMINI_REVIEW_PROMPT = """You are reviewing a trade idea from Groq, your fellow AI on this
+trading desk. Groq wants to trade the DEMO (Exness) account with this setup:
+
+Symbol: {symbol}
+Action: {action}
+Confidence: {confidence}%
+Groq's reasoning: {reason}
+Full scan data (all pairs Groq looked at): {scanned_json}
+
+Do you agree with Groq's reasoning and pick? Respond with ONLY raw JSON (no markdown), in exactly
+this shape:
+{{"agree": true|false, "note": "one short sentence", "better_symbol": string|null}}
+
+Only set better_symbol if you disagree AND you see a clearly stronger setup among the pairs Groq
+scanned. Leave it null if you disagree but don't see anything better right now — that means hold.
+"""
+
+
+async def _ask_gemini_review_of_groq(scan: dict) -> dict | None:
+    """Gemini's review of Groq's pick for the demo/Exness leg. Returns None if Gemini is
+    unavailable (budget spent / API error) — callers fall back to Groq's own pick."""
+    if not _gemini_scan_budget_available():
+        return None
+    prompt = GROQ_TO_GEMINI_REVIEW_PROMPT.format(
+        symbol=scan.get("best_symbol"), action=scan.get("action"), confidence=scan.get("confidence"),
+        reason=scan.get("reason", ""), scanned_json=json.dumps(scan.get("scanned", {}))[:2000],
+    )
+    try:
+        _bump_gemini_scan_count()
+        text = _clean_json_text(await _call_gemini_raw(prompt, timeout=60))
+        return json.loads(text)
+    except Exception:
+        return None
+
+
+async def _run_demo_leg(*, positions: list, pairs_data: dict, news_context: str, entry_base: dict,
+                         conn, get_price) -> dict:
+    """Exness demo account leg. Per Icon's spec: Groq is the primary analyst — it scans
+    every pair first and picks the best setup. Gemini then reviews Groq's pick and
+    reasoning:
+      - Gemini agrees        -> Groq's pick stands, trade proceeds.
+      - Gemini disagrees and suggests a different pair -> Groq compares the historical
+        win rate of the suggested pair against its own pick (from the unified trade log)
+        and goes with whichever has the better track record. No data / a tie stays with
+        Groq's own pick, since it's his call.
+      - Gemini disagrees and suggests nothing -> hold this cycle.
+    """
+    entry = dict(entry_base)
+    entry["account"] = "demo"
+
+    open_count = len(positions)
+    if open_count >= MAX_OPEN_POSITIONS:
+        entry.update({"status": "skipped", "reason": f"{open_count} open demo position(s), max is {MAX_OPEN_POSITIONS}"})
+        return entry
+
+    last_close = _last_close_time.get("demo")
+    if last_close:
+        elapsed = (datetime.now(timezone.utc) - last_close).total_seconds()
+        if elapsed < COOLDOWN_SECONDS:
+            remaining_min = int((COOLDOWN_SECONDS - elapsed) / 60) + 1
+            entry.update({"status": "skipped", "reason": f"Cooldown active on demo — {remaining_min} min left since last close"})
+            return entry
+
+    scan = await _ask_groq_scan(pairs_data, news_context)
+    entry["scanned"] = scan.get("scanned", {})
+
+    action = scan.get("action", "hold")
+    best_symbol = scan.get("best_symbol")
+    confidence = scan.get("confidence", 0)
+    min_confidence = _current_min_confidence()
+    already_holding = best_symbol and any(p["symbol"] == best_symbol for p in positions)
+
+    stack_reason = None
+    if action in ("buy", "sell") and best_symbol and confidence >= min_confidence:
+        if already_holding:
+            stack_reason = f"Already holding an open position on {best_symbol} — skipping duplicate"
+        elif open_count > 0 and confidence < STACK_MIN_CONFIDENCE:
+            stack_reason = f"{open_count} position(s) already open — need {STACK_MIN_CONFIDENCE}+ confidence to stack another, got {confidence}"
+
+    if action not in ("buy", "sell") or not best_symbol or confidence < min_confidence or stack_reason:
+        entry.update({"status": "hold", "decision": scan, "hold_reason": stack_reason})
+        return entry
+
+    # --- Gemini reviews Groq's pick ---
+    review = await _ask_gemini_review_of_groq(scan)
+    final_symbol, final_action, final_reason = best_symbol, action, scan.get("reason", "")
+    review_note = None
+
+    if review is None:
+        review_note = "Gemini review unavailable (budget/API) — going with Groq's own pick."
+    elif review.get("agree"):
+        review_note = f"Gemini agrees: {review.get('note', '')}"
+    else:
+        suggested = review.get("better_symbol")
+        if not suggested:
+            entry.update({
+                "status": "hold", "decision": scan,
+                "hold_reason": f"Gemini disagreed and suggested no alternative: {review.get('note', '')}",
+            })
+            _log_conversation("Gemini", f"[demo] Disagree with Groq on {best_symbol}, nothing better right now — {review.get('note', '')[:200]}")
+            return entry
+
+        groq_rate = _symbol_success_rate(best_symbol, account="demo")
+        gemini_rate = _symbol_success_rate(suggested, account="demo")
+
+        if gemini_rate is not None and (groq_rate is None or gemini_rate > groq_rate):
+            suggested_info = (scan.get("scanned") or {}).get(suggested, {})
+            suggested_action = suggested_info.get("action")
+            if suggested_action in ("buy", "sell"):
+                final_symbol = suggested
+                final_action = suggested_action
+                final_reason = f"Switched to Gemini's suggestion {suggested} (demo win rate {gemini_rate}% vs {best_symbol}'s {groq_rate}%) — {review.get('note', '')}"
+                review_note = f"Gemini suggested {suggested} instead; Groq switches — better track record."
+            else:
+                review_note = f"Gemini suggested {suggested} but Groq had no buy/sell read on it this cycle — sticking with own pick."
+        else:
+            review_note = f"Gemini suggested {suggested}; Groq keeps its own pick on {best_symbol} (win rate {groq_rate} vs {gemini_rate})."
+
+    if review_note:
+        _log_conversation("Groq", f"[demo] {review_note}")
+
+    scan = dict(scan)
+    scan["best_symbol"] = final_symbol
+    scan["action"] = final_action
+    scan["reason"] = final_reason
+
+    # Independent sanity check before firing — DeepSeek reviews the final decision.
+    verdict_context = (
+        f"[demo/groq+gemini] Decision: {final_action.upper()} {final_symbol}, confidence {confidence}%, "
+        f"reason: {final_reason}. Full scan: {json.dumps(scan)[:2000]}"
+    )
+    verdict = await _ask_deepseek_verdict(verdict_context)
+    if verdict is not None and verdict.get("agree") is False:
+        entry.update({
+            "status": "hold", "decision": scan,
+            "veto": {"deepseek_agree": False, "deepseek_note": verdict.get("note")},
+        })
+        deepseek_review["time"] = datetime.now(timezone.utc).isoformat()
+        deepseek_review["text"] = f"[demo] Vetoed {final_action.upper()} {final_symbol}: {verdict.get('note', '')}"
+        return entry
+
+    # Staleness check
+    try:
+        price_at_scan = await get_price(final_symbol)
+        price_now = await get_price(final_symbol)
+        moved_pct = abs(price_now - price_at_scan) / price_at_scan * 100 if price_at_scan else 0
+    except Exception:
+        price_now, moved_pct = None, 0
+
+    if moved_pct > PRICE_STALENESS_PCT:
+        entry.update({
+            "status": "hold", "decision": scan,
+            "reason": f"Price moved {moved_pct:.3f}% (>{PRICE_STALENESS_PCT}%) between decision and execution — stale, skipped",
+        })
+        return entry
+
+    # R:R auto-correction (same rule as the real leg)
+    sl, tp = scan.get("stop_loss"), scan.get("take_profit")
+    if price_now and sl and tp:
+        risk = abs(price_now - sl)
+        reward = abs(tp - price_now)
+        if risk > 0 and reward / risk < MIN_RISK_REWARD:
+            direction = 1 if final_action == "buy" else -1
+            new_tp = round(price_now + direction * risk * MIN_RISK_REWARD, 5)
+            scan["take_profit"] = new_tp
+            scan["reason"] = (scan.get("reason", "") + f" [TP auto-adjusted from {tp} to {new_tp} to meet {MIN_RISK_REWARD}:1 R:R minimum]").strip()
+
+    volume = _smart_volume(final_symbol, confidence, entry_price=price_now, sl=scan.get("stop_loss"))
+    volume = _enforce_min_lot(final_symbol, round(volume * _current_lot_scale(), 2))
+
+    try:
+        result = await _place_trade(
+            conn, final_symbol, final_action, volume,
+            sl=scan.get("stop_loss"), tp=scan.get("take_profit"),
+            confidence=confidence, reason=scan.get("reason", ""), source="autotrade", account="demo",
+        )
+    except Exception as e:
+        entry.update({"status": "error", "reason": f"trade execution failed: {str(e)[:200]}"})
+        return entry
+
+    entry.update({"status": "trade_placed", "decision": scan, "result": result})
+    opinion = await _ask_deepseek_opinion(
+        f"[demo/groq+gemini] Decision: {final_action.upper()} {final_symbol} @ {volume} lots, confidence {confidence}%, "
+        f"reason: {scan.get('reason', '')}. Full scan: {json.dumps(scan)[:2000]}"
+    )
+    if opinion:
+        deepseek_review["time"] = datetime.now(timezone.utc).isoformat()
+        deepseek_review["text"] = f"[demo/groq+gemini] {opinion}"
+    return entry
+
+
 async def _run_autotrade_cycle():
-    """One scan cycle, one shared market snapshot, two independent AIs each trading
-    their own account: Gemini decides for the real MetaApi account, Groq decides for
-    the built-in sim account. This is the single thing every trigger (cron, dashboard
-    button, internal scheduler) calls now — no second cron job needed to compare them."""
+    """One scan cycle, one shared market snapshot, two independently-run live accounts:
+    Gemini decides for the 'real' MetaApi account; the 'demo' account (your live Exness
+    demo, connected the same way via MetaApi) is decided by Groq scanning first and
+    Gemini reviewing Groq's reasoning/pick (see _run_demo_leg). This is the single thing
+    every trigger (cron, dashboard button, internal scheduler) calls now."""
     if autotrade_status.get("state") == "analyzing":
         return  # already running (internal scheduler + external cron overlapped) — skip
     autotrade_status.update({"state": "analyzing", "since": datetime.now(timezone.utc).isoformat(), "note": "Scanning watchlist..."})
@@ -952,7 +1020,7 @@ async def _run_autotrade_cycle():
     if real_available:
         try:
             _, real_conn = await _connect_account(MT_LOGIN, MT_PASSWORD, MT_SERVER, MT_PLATFORM)
-            closed = await _manage_real_positions()
+            closed = await _manage_broker_positions("real")
             real_positions = await real_conn.get_positions()
             if closed:
                 entry_base["real_closed"] = closed
@@ -963,36 +1031,36 @@ async def _run_autotrade_cycle():
     elif not REAL_LEG_ENABLED:
         pass  # real leg intentionally paused — skip silently, no connect attempt, no log spam
 
-    # ---- Sim / Groq leg setup (with the existing "at max" cooldown so we're not
-    # hammering the safety-close check every cycle once the book is full) ----
-    sim_at_max = len(sim_account["positions"]) >= MAX_OPEN_POSITIONS
-    run_sim_safety_check = True
-    if sim_at_max:
-        now_ts = datetime.now(timezone.utc).timestamp()
-        last = _last_maxed_check["time"]
-        run_sim_safety_check = last is None or now_ts - last >= MANAGE_CHECK_INTERVAL_WHEN_MAXED
-        if run_sim_safety_check:
-            _last_maxed_check["time"] = now_ts
-    if run_sim_safety_check:
-        closed = await _manage_sim_positions()
-        if closed:
-            entry_base["sim_closed"] = closed
-    sim_positions = await _sim_positions()
+    # ---- Demo / Exness leg setup (Groq analyzes first, Gemini reviews) ----
+    demo_creds = ACCOUNTS["demo"]
+    demo_available = all([demo_creds["login"], demo_creds["password"], demo_creds["server"]])
+    demo_conn, demo_positions = None, []
+    if demo_available:
+        try:
+            _, demo_conn = await _connect_account(demo_creds["login"], demo_creds["password"], demo_creds["server"], demo_creds["platform"])
+            closed = await _manage_broker_positions("demo")
+            demo_positions = await demo_conn.get_positions()
+            if closed:
+                entry_base["demo_closed"] = closed
+        except Exception as e:
+            demo_available = False
+            autotrade_log.append({**entry_base, "account": "demo", "status": "error",
+                                   "reason": f"Exness connect/fetch failed: {str(e)[:200]}"})
 
     real_has_room = real_available and len(real_positions) < MAX_OPEN_POSITIONS
-    sim_has_room = len(sim_positions) < MAX_OPEN_POSITIONS
+    demo_has_room = demo_available and len(demo_positions) < MAX_OPEN_POSITIONS
 
-    if not real_has_room and not sim_has_room:
-        legs = (["real"] if real_available else []) + ["sim"]
+    if not real_has_room and not demo_has_room:
+        legs = (["real"] if real_available else []) + (["demo"] if demo_available else [])
         for label in legs:
             autotrade_log.append({**entry_base, "account": label, "status": "skipped",
                                    "reason": f"At max positions, max is {MAX_OPEN_POSITIONS}"})
         del autotrade_log[:-50]
-        autotrade_status.update({"state": "idle", "note": "Both accounts at max positions — skipped scan"})
+        autotrade_status.update({"state": "idle", "note": "Both accounts at max positions (or unavailable) — skipped scan"})
         return
 
-    # One shared snapshot for both AIs — this is the whole point of merging the two
-    # cron paths: Twelve Data's free-tier budget only gets spent once per cycle now.
+    # One shared snapshot for both AIs — Twelve Data's free-tier budget only gets spent
+    # once per cycle no matter how many accounts/legs are trading off of it.
     pairs_data = await _fetch_multi_snapshot()
     if pairs_data.get("_fetch_errors"):
         entry_base["fetch_errors"] = pairs_data["_fetch_errors"]
@@ -1012,18 +1080,17 @@ async def _run_autotrade_cycle():
         results.append({**entry_base, "account": "real", "status": "skipped",
                          "reason": "MT_LOGIN/MT_PASSWORD/MT_SERVER not set — real leg disabled"})
 
-    autotrade_status["note"] = "Groq analyzing sim-account setups..."
-    if real_available:
-        await asyncio.sleep(5)  # give the Groq TPM window room if real's leg just used a fallback call
-    results.append(await _run_trade_leg(
-        label="sim", provider="groq", positions=sim_positions, pairs_data=pairs_data,
-        news_context=news_context, entry_base=entry_base, get_price=_get_price,
-        place_trade=lambda symbol, action, volume, scan: sim_trade({
-            "symbol": symbol, "side": action, "volume": volume,
-            "sl": scan.get("stop_loss"), "tp": scan.get("take_profit"),
-            "confidence": scan.get("confidence", 0), "reason": scan.get("reason", ""), "source": "autotrade-sim",
-        }),
-    ))
+    if demo_available:
+        autotrade_status["note"] = "Groq analyzing Exness demo setups (Gemini reviewing)..."
+        if real_available:
+            await asyncio.sleep(5)  # give the Groq TPM window room if real's leg just used a fallback call
+        results.append(await _run_demo_leg(
+            positions=demo_positions, pairs_data=pairs_data, news_context=news_context,
+            entry_base=entry_base, conn=demo_conn, get_price=_get_price,
+        ))
+    else:
+        results.append({**entry_base, "account": "demo", "status": "skipped",
+                         "reason": "MT2_LOGIN/MT2_PASSWORD/MT2_SERVER not set — Exness demo leg disabled"})
 
     autotrade_log.extend(results)
     del autotrade_log[:-50]
@@ -1044,7 +1111,8 @@ async def get_autotrade_status():
 @app.post("/api/autotrade-run")
 async def autotrade_run(background_tasks: BackgroundTasks):
     """Manual trigger for the 'Run Scan Now' button on the dashboard — runs the same
-    dual-account cycle (Gemini -> real, Groq -> sim) as the cron-triggered endpoints."""
+    dual-account cycle (Gemini -> real, Groq+Gemini-review -> demo/Exness) as the
+    cron-triggered endpoints."""
     if autotrade_status.get("state") == "analyzing":
         return {"status": "already_running", "note": "A scan is already in progress"}
     background_tasks.add_task(_run_autotrade_cycle)
@@ -1062,9 +1130,10 @@ async def autotrade_sim_head(secret: str = Query(...)):
 
 @app.get("/api/autotrade-sim")
 async def autotrade_sim(secret: str = Query(...), background_tasks: BackgroundTasks = None):
-    """Kept for backward compatibility with any cron already pointed at this URL —
+    """URL kept for backward compatibility with any cron already pointed at it — the
+    'sim' name is legacy from before the demo account was the live Exness account. It
     now triggers the SAME dual-account cycle as /api/autotrade (Gemini -> real,
-    Groq -> sim), so you don't need two cron jobs pointed at two different endpoints."""
+    Groq+Gemini-review -> demo/Exness), so you don't need a second cron job."""
     if not AUTOTRADE_SECRET or secret != AUTOTRADE_SECRET:
         raise HTTPException(403, "Invalid secret")
     background_tasks.add_task(_run_autotrade_cycle)
@@ -1079,11 +1148,31 @@ GROQ_MODEL = os.getenv("GROQ_MODEL", "llama-3.1-8b-instant")
 DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY", "")
 DEEPSEEK_MODEL = os.getenv("DEEPSEEK_MODEL", "deepseek-chat")
 AUTOTRADE_SECRET = os.getenv("AUTOTRADE_SECRET", "")
+
 MT_LOGIN = os.getenv("MT_LOGIN", "")
 MT_PASSWORD = os.getenv("MT_PASSWORD", "")
 MT_SERVER = os.getenv("MT_SERVER", "")
 MT_PLATFORM = os.getenv("MT_PLATFORM", "mt5")
-REAL_LEG_ENABLED = os.getenv("REAL_LEG_ENABLED", "true").lower() == "true"  # set to "false" to skip MetaApi entirely and run sim-only
+REAL_LEG_ENABLED = os.getenv("REAL_LEG_ENABLED", "true").lower() == "true"  # set to "false" to skip this account entirely
+
+# The "demo" account — now a live Exness MT5 demo account connected via MetaApi, same as
+# "real" above. Set these in your hosting platform's environment variables (Railway ->
+# Variables), NOT in code:
+#   MT2_LOGIN=476184063
+#   MT2_PASSWORD=<your Exness password>
+#   MT2_SERVER=Exness-MT5Trial9
+#   MT2_PLATFORM=mt5
+MT2_LOGIN = os.getenv("MT2_LOGIN", "")
+MT2_PASSWORD = os.getenv("MT2_PASSWORD", "")
+MT2_SERVER = os.getenv("MT2_SERVER", "")
+MT2_PLATFORM = os.getenv("MT2_PLATFORM", "mt5")
+
+# Central lookup so any code that needs "the creds for account X" has one place to check.
+ACCOUNTS = {
+    "real": {"login": MT_LOGIN, "password": MT_PASSWORD, "server": MT_SERVER, "platform": MT_PLATFORM},
+    "demo": {"login": MT2_LOGIN, "password": MT2_PASSWORD, "server": MT2_SERVER, "platform": MT2_PLATFORM},
+}
+
 TRADE_VOLUME_DEFAULT = float(os.getenv("TRADE_VOLUME", "0.01"))
 MAX_OPEN_POSITIONS = int(os.getenv("MAX_OPEN_POSITIONS", "3"))
 STACK_MIN_CONFIDENCE = int(os.getenv("STACK_MIN_CONFIDENCE", "80"))  # bar to add another trade while one's already open
@@ -1120,7 +1209,9 @@ def _smart_volume(symbol: str, confidence: float, entry_price=None, sl=None) -> 
 
     return round(max(scaled, MIN_LOT[cls]), 2)
 
-WATCHLIST = ["XAUUSD", "EURUSD", "GBPUSD", "USDJPY", "AUDUSD", "USDCAD"]
+# BTCUSD/ETHUSD back on the watchlist now that the demo account is on Exness, which
+# supports crypto (the "real" account still doesn't — see REAL_UNSUPPORTED_SYMBOLS above).
+WATCHLIST = ["XAUUSD", "EURUSD", "GBPUSD", "USDJPY", "AUDUSD", "USDCAD", "BTCUSD", "ETHUSD"]
 SCAN_TIMEFRAMES = ["15min", "1h", "4h"]  # 30min dropped — it was fetched but never reached the prompt
 MIN_CONFIDENCE = int(os.getenv("MIN_CONFIDENCE", "70"))
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-flash-latest")  # override via env var if needed
@@ -1168,7 +1259,7 @@ async def _call_groq_raw(prompt: str, timeout=90) -> str:
 
 
 async def _call_llm_text(prompt: str, timeout=90) -> str:
-    """Single-turn call for JSON-schema prompts (scan/strategy/manage). Tries Gemini
+    """Single-turn call for JSON-schema prompts (scan/strategy). Tries Gemini
     first, falls back to Groq automatically if Gemini is down/quota-blocked."""
     errors = []
     for name, fn in (("Gemini", _call_gemini_raw), ("Groq", _call_groq_raw)):
@@ -1252,14 +1343,14 @@ async def _call_llm_chat(system: str, history: list, message: str, timeout=60) -
 # so the trading AI and chat AI's combined findings get a third perspective.
 deepseek_review = {"time": None, "text": None}
 
-# Exactly what was sent to the AI on the last real/sim scan — candles, SMA/RSI,
+# Exactly what was sent to the AI on the last real/demo scan — candles, SMA/RSI,
 # per pair/timeframe — so you can inspect what it actually saw, not just what it decided.
-_last_scan_debug: Dict[str, dict] = {"real": None, "sim": None}
+_last_scan_debug: Dict[str, dict] = {"real": None, "demo": None}
 
 
 @app.get("/api/last-scan-data")
 async def get_last_scan_data():
-    """Raw input data the AI was given on its most recent real-leg and sim-leg
+    """Raw input data the AI was given on its most recent real-leg and demo-leg
     scans — candles/SMA/RSI per pair per timeframe. Use this to check whether
     the AI's SL/TP picks actually line up with real recent highs/lows."""
     return _last_scan_debug
@@ -1461,11 +1552,11 @@ PROMPT_TIMEFRAMES = ["15min", "1h", "4h"]  # all three timeframes the prompt act
 
 
 def _compact_for_prompt(pairs_data: dict, candles_per_tf: int = 12) -> dict:
-    """The full snapshot (6 pairs x 4 timeframes x 30 candles) is ~700+ candle objects —
-    way past free-tier TPM limits (Groq's 8B model caps at 6000 TPM, shared across ALL
-    calls in that same minute — not just this one). This trims it to just what the LLM
-    needs: only the 2 timeframes it's instructed to actually use, fewer recent candles,
-    compact [o,h,l,c] arrays instead of repeated keys, and rounded prices."""
+    """The full snapshot (8 pairs x 4 timeframes x 30 candles) is way past free-tier TPM
+    limits (Groq's 8B model caps at 6000 TPM, shared across ALL calls in that same minute —
+    not just this one). This trims it to just what the LLM needs: only the timeframes it's
+    instructed to actually use, fewer recent candles, compact [o,h,l,c] arrays instead of
+    repeated keys, and rounded prices."""
     compact = {}
     for symbol, timeframes in pairs_data.items():
         if symbol == "_fetch_errors":
@@ -1485,9 +1576,10 @@ def _compact_for_prompt(pairs_data: dict, candles_per_tf: int = 12) -> dict:
 
 
 async def _ask_gemini_scan(pairs_data: dict, news_context: str = "not checked this run") -> dict:
-    """Gemini and Groq each independently analyze the same data, then a trade only
-    fires if they agree — otherwise it's held as a split decision. Their reasoning
-    is logged as a live conversation for the dashboard."""
+    """Legacy joint scan (used only by /api/scan-test now) — Gemini and Groq each
+    independently analyze the same data and a trade only 'fires' in this test path if
+    they agree. Not used by the live autotrade cycle anymore (see _ask_real_leg_scan /
+    _ask_groq_scan / _run_demo_leg instead)."""
     if not GEMINI_API_KEY and not GROQ_API_KEY:
         raise HTTPException(500, "Neither GEMINI_API_KEY nor GROQ_API_KEY is set on the server")
 
@@ -1581,9 +1673,9 @@ async def _raw_scan_call(name: str, fn, prompt: str, tag: str) -> dict:
 
 
 async def _ask_real_leg_scan(pairs_data: dict, news_context: str = "not checked this run") -> dict:
-    """Real MT5 demo account: Gemini decides. If Gemini can't answer — daily scan
-    budget spent, API error, timeout — Groq's independent read is used instead so
-    the real account doesn't just sit idle. This never touches the sim leg."""
+    """Real account: Gemini decides. If Gemini can't answer — daily scan budget spent,
+    API error, timeout — Groq's independent read is used instead so the real account
+    doesn't just sit idle. This never touches the demo leg."""
     candles_per_tf = 8
     compact = _compact_for_prompt(pairs_data, candles_per_tf)
     _last_scan_debug["real"] = {"time": datetime.now(timezone.utc).isoformat(), "data": compact, "news_context": news_context}
@@ -1609,12 +1701,13 @@ async def _ask_real_leg_scan(pairs_data: dict, news_context: str = "not checked 
     return result
 
 
-async def _ask_sim_leg_scan(pairs_data: dict, news_context: str = "not checked this run") -> dict:
-    """Sim (paper-trading) account: always Groq, fully independent of the real leg —
-    no fallback to Gemini, no dependency on Gemini's daily budget."""
+async def _ask_groq_scan(pairs_data: dict, news_context: str = "not checked this run") -> dict:
+    """Groq's independent, primary read on the whole watchlist — this is the FIRST step
+    of the demo/Exness leg's decision flow (see _run_demo_leg): Groq scans and picks a
+    setup on its own, then Gemini reviews that pick before anything is executed."""
     candles_per_tf = 8
     compact = _compact_for_prompt(pairs_data, candles_per_tf)
-    _last_scan_debug["sim"] = {"time": datetime.now(timezone.utc).isoformat(), "data": compact, "news_context": news_context}
+    _last_scan_debug["demo"] = {"time": datetime.now(timezone.utc).isoformat(), "data": compact, "news_context": news_context}
     prompt = SCAN_PROMPT.format(
         risk_notes=settings["risk_notes"] or "No specific preferences stated — use conservative default risk management.",
         min_confidence=MIN_CONFIDENCE,
@@ -1622,17 +1715,18 @@ async def _ask_sim_leg_scan(pairs_data: dict, news_context: str = "not checked t
         candles_per_tf=candles_per_tf,
         pairs_json=json.dumps(compact),
     )
-    result = await _raw_scan_call("Groq", _call_groq_raw, prompt, "sim")
+    result = await _raw_scan_call("Groq", _call_groq_raw, prompt, "demo")
     result.pop("_failed", None)
     return result
 
 
 async def _ask_single_ai_scan(provider: str, pairs_data: dict, news_context: str = "not checked this run") -> dict:
-    """Dispatcher used by _run_trade_leg: 'gemini' -> real leg (Gemini w/ Groq
-    fallback), anything else (e.g. 'groq') -> sim leg (Groq only)."""
+    """Dispatcher used by _run_trade_leg (real leg only, provider='gemini' -> Gemini
+    w/ Groq fallback). The demo leg no longer goes through this — it calls
+    _ask_groq_scan directly as the first step of _run_demo_leg's negotiation flow."""
     if provider == "gemini":
         return await _ask_real_leg_scan(pairs_data, news_context)
-    return await _ask_sim_leg_scan(pairs_data, news_context)
+    return await _ask_groq_scan(pairs_data, news_context)
 
 
 STRATEGY_PROMPT = """You are a disciplined ICT / Smart Money Concepts forex and gold trader.
@@ -1684,7 +1778,7 @@ autotrade_log = []  # in-memory log of recent AI decisions, newest last
 @app.get("/api/scan-test")
 async def scan_test(secret: str = Query(...)):
     """Test the AI's multi-pair scan WITHOUT connecting to MetaApi or placing any
-    trade — safe to use right now while your MetaApi account is blocked on billing."""
+    trade — safe to use for a dry-run check."""
     if not AUTOTRADE_SECRET or secret != AUTOTRADE_SECRET:
         raise HTTPException(403, "Invalid secret")
 
@@ -1719,7 +1813,7 @@ async def _run_autotrade():
     try:
         account_id, conn = await _connect_account(MT_LOGIN, MT_PASSWORD, MT_SERVER, MT_PLATFORM)
 
-        closed = await _manage_real_positions()
+        closed = await _manage_broker_positions("real")
         if closed:
             entry["closed"] = closed
 
@@ -1819,7 +1913,7 @@ async def _github_save_state():
     if not GITHUB_TOKEN or not GITHUB_REPO:
         return
     _, sha = await _github_get_state()
-    payload = {"settings": settings, "chat_history": chat_history[-40:], "sim_account": sim_account, "trade_log": trade_log[-200:]}
+    payload = {"settings": settings, "chat_history": chat_history[-40:], "trade_log": trade_log[-200:]}
     content_b64 = base64.b64encode(json.dumps(payload, indent=2).encode()).decode()
     url = f"https://api.github.com/repos/{GITHUB_REPO}/contents/{STATE_FILE_PATH}"
     headers = {"Authorization": f"Bearer {GITHUB_TOKEN}", "Accept": "application/vnd.github+json"}
@@ -1890,7 +1984,7 @@ async def _autotrade_scheduler_loop():
     while True:
         await asyncio.sleep(_current_scan_interval())
         try:
-            await _run_autotrade_cycle()  # handles both real (Gemini) and sim (Groq) legs, plus position management for both
+            await _run_autotrade_cycle()  # handles both real (Gemini) and demo/Exness (Groq analyzes, Gemini reviews) legs, plus position management for both
         except Exception as e:
             print(f"[scheduler] autotrade cycle failed: {e}")
 
@@ -1918,10 +2012,6 @@ async def _load_state_on_startup():
             saved_settings = {k: v for k, v in saved_settings.items() if k != "lot_sizes"}
         settings.update(saved_settings)
         chat_history.extend(state.get("chat_history", []))
-        saved_sim = state.get("sim_account")
-        if saved_sim:
-            sim_account["balance"] = saved_sim.get("balance", sim_account["balance"])
-            sim_account["positions"] = saved_sim.get("positions", [])
         saved_trades = state.get("trade_log")
         if saved_trades:
             trade_log.extend(saved_trades)
@@ -1963,8 +2053,8 @@ async def update_settings(payload: dict = Body(...)):
 
 @app.get("/api/trades")
 async def get_trades():
-    """Unified trade log — every trade taken (manual, chat, or auto), real or
-    demo, with entry/SL/TP/lot size/risk-reward/expected & actual P/L/confidence/reason."""
+    """Unified trade log — every trade taken (manual, chat, or auto), on either live
+    account, with entry/SL/TP/lot size/risk-reward/expected & actual P/L/confidence/reason."""
     return list(reversed(trade_log))
 
 
@@ -1996,7 +2086,13 @@ async def trade_preview(symbol: str, side: str, volume: float, sl: float = None,
 CHAT_SYSTEM_PROMPT = """You are the trading assistant embedded in Icon's trading dashboard.
 You can chat normally about markets, strategy, and risk management.
 
-The auto-trader scans this ENTIRE watchlist every cycle, not just one pair: {watchlist}
+There are TWO live MetaApi accounts now, both real broker connections:
+- "real": Gemini scans and decides on its own (falls back to Groq if Gemini's daily budget is spent).
+- "demo": your Exness demo account. Groq scans and picks first; Gemini then reviews Groq's pick and
+  reasoning. If Gemini agrees, Groq's pick is used. If Gemini disagrees and suggests a different pair,
+  Groq compares each pair's historical win rate and goes with whichever has performed better. If
+  Gemini disagrees and has no better suggestion, that cycle is a hold.
+Both accounts share the SAME watchlist scan each cycle: {watchlist}
 It checks these timeframes on each pair: {scan_timeframes}
 A trade only fires if a pair scores {min_confidence}+ confidence out of 100.
 Max loss per position: ${max_loss}, profit target: ${profit_target}.
@@ -2010,10 +2106,10 @@ You can place a trade immediately if the user explicitly asks (e.g. "buy gold no
 Only trigger a trade on a clear, explicit instruction — never on your own initiative.
 
 IMPORTANT — you and the Auto-Trading AI share ONE unified trade log (below, under "Recent trades").
-It contains every trade either of you has taken, real or demo, with entry/SL/TP/lot size/risk-reward/
-expected P/L/actual P/L/confidence/reason. Always check it before answering questions like "did you buy
-gold" or "what happened to my trade" — if a trade is listed there, it WAS placed; never claim no trade
-was placed just because you personally didn't place it in this chat turn.
+It contains every trade either of you has taken, on either account, with entry/SL/TP/lot size/
+risk-reward/expected P/L/actual P/L/confidence/reason. Always check it before answering questions like
+"did you buy gold" or "what happened to my trade" — if a trade is listed there, it WAS placed; never
+claim no trade was placed just because you personally didn't place it in this chat turn.
 
 LIVE DATA (use this — do not guess or use outdated training knowledge):
 {live_data}
@@ -2024,7 +2120,7 @@ thinks, or wants a second opinion, relay this — do not claim you have no acces
 
 If the user asks to change the pair, timeframe, lot size, or states a risk management
 preference, update it via settings_update. Timeframe must be one of: 1min, 5min, 15min, 1h, 4h, 1day.
-Symbol should be a 6-letter forex/metal pair like XAUUSD, EURUSD, GBPUSD (no slash).
+Symbol should be a 6-letter forex/metal pair like XAUUSD, EURUSD, GBPUSD (no slash), or BTCUSD/ETHUSD.
 
 Respond with ONLY raw JSON (no markdown, no code fences), in exactly this shape:
 {{"reply": "your conversational reply to show the user",
@@ -2065,16 +2161,32 @@ async def _live_data_snapshot():
             _, conn = await _connect_account(MT_LOGIN, MT_PASSWORD, MT_SERVER, MT_PLATFORM)
             info = await conn.get_account_information()
             positions = await conn.get_positions()
-            parts.append(f"Account balance: {info.get('balance')} {info.get('currency')}, equity: {info.get('equity')}")
+            parts.append(f"Real account balance: {info.get('balance')} {info.get('currency')}, equity: {info.get('equity')}")
             if positions:
                 pos_desc = ", ".join(f"{p['symbol']} {p['type']} {p['volume']} lots (P/L {p['profit']})" for p in positions)
-                parts.append(f"Open positions: {pos_desc}")
+                parts.append(f"Real account open positions: {pos_desc}")
             else:
-                parts.append("Open positions: none")
+                parts.append("Real account open positions: none")
         except Exception:
-            parts.append("(couldn't fetch account balance right now)")
+            parts.append("(couldn't fetch real account balance right now)")
     elif not REAL_LEG_ENABLED:
-        parts.append("Real MT5 account: currently paused (REAL_LEG_ENABLED=false) — trading sim-only for now.")
+        parts.append("Real MT5 account: currently paused (REAL_LEG_ENABLED=false).")
+
+    if all([MT2_LOGIN, MT2_PASSWORD, MT2_SERVER]):
+        try:
+            _, dconn = await _connect_account(MT2_LOGIN, MT2_PASSWORD, MT2_SERVER, MT2_PLATFORM)
+            dinfo = await dconn.get_account_information()
+            dpositions = await dconn.get_positions()
+            parts.append(f"Demo (Exness) account balance: {dinfo.get('balance')} {dinfo.get('currency')}, equity: {dinfo.get('equity')}")
+            if dpositions:
+                dpos_desc = ", ".join(f"{p['symbol']} {p['type']} {p['volume']} lots (P/L {p['profit']})" for p in dpositions)
+                parts.append(f"Demo (Exness) account open positions: {dpos_desc}")
+            else:
+                parts.append("Demo (Exness) account open positions: none")
+        except Exception:
+            parts.append("(couldn't fetch Exness demo account balance right now)")
+    else:
+        parts.append("Demo (Exness) account: not configured yet — set MT2_LOGIN/MT2_PASSWORD/MT2_SERVER.")
 
     if autotrade_log:
         last_entry = autotrade_log[-1]
@@ -2205,23 +2317,18 @@ async def chat(payload: dict = Body(...)):
         target_symbol = (close_action.get("symbol") or "").upper().replace("/", "") or None
         closed = []
 
-        for pos in list(sim_account["positions"]):
-            if target_symbol and pos["symbol"].upper() != target_symbol:
+        for label, creds in ACCOUNTS.items():
+            if not all([creds["login"], creds["password"], creds["server"]]):
                 continue
-            result = await sim_close(pos["id"])
-            closed.append(f"{pos['symbol']} ({result.get('pnl')} P/L, demo)")
-
-        real_account_available = REAL_LEG_ENABLED and all([MT_LOGIN, MT_PASSWORD, MT_SERVER])
-        if real_account_available:
             try:
-                _, conn = await _connect_account(MT_LOGIN, MT_PASSWORD, MT_SERVER, MT_PLATFORM)
-                real_positions = await conn.get_positions()
-                for pos in real_positions:
+                _, conn = await _connect_account(creds["login"], creds["password"], creds["server"], creds["platform"])
+                positions = await conn.get_positions()
+                for pos in positions:
                     if target_symbol and pos.get("symbol", "").upper() != target_symbol:
                         continue
                     await conn.close_position(pos["id"])
                     _log_trade_close(pos["id"], (pos or {}).get("profit"))
-                    closed.append(f"{pos.get('symbol')} (real)")
+                    closed.append(f"{pos.get('symbol')} ({label})")
             except Exception:
                 pass
 
@@ -2241,6 +2348,7 @@ async def chat(payload: dict = Body(...)):
 
         real_account_available = REAL_LEG_ENABLED and all([MT_LOGIN, MT_PASSWORD, MT_SERVER])
         placed_on = None
+        result = None
 
         if real_account_available:
             try:
@@ -2251,29 +2359,39 @@ async def chat(payload: dict = Body(...)):
                     reason="Manual command via chat", source="chat", account="real",
                 )
                 placed_on = "real"
-            except Exception as e:
+            except Exception:
                 result = None
-                real_error = str(e)
+                placed_on = None
 
         if placed_on != "real":
-            # fall back to the built-in demo account so trade commands still work
-            # while the real MetaApi account is blocked/unavailable
-            result = await sim_trade({
-                "symbol": trade_symbol, "side": trade_action["side"], "volume": trade_volume,
-                "sl": trade_action.get("stop_loss"), "tp": trade_action.get("take_profit"),
-                "reason": "Manual command via chat", "source": "chat",
-            })
-            placed_on = "demo"
+            # fall back to the Exness demo account so trade commands still work
+            # while the real account is unavailable
+            demo_available = all([MT2_LOGIN, MT2_PASSWORD, MT2_SERVER])
+            if demo_available:
+                try:
+                    _, dconn = await _connect_account(MT2_LOGIN, MT2_PASSWORD, MT2_SERVER, MT2_PLATFORM)
+                    result = await _place_trade(
+                        dconn, trade_symbol, trade_action["side"], trade_volume,
+                        sl=trade_action.get("stop_loss"), tp=trade_action.get("take_profit"),
+                        reason="Manual command via chat", source="chat", account="demo",
+                    )
+                    placed_on = "demo"
+                except Exception:
+                    result = None
+                    placed_on = None
 
-        label = "on your REAL account" if placed_on == "real" else "on your DEMO account (real account unavailable right now)"
-        reply += f"\n\n✅ Placed {trade_action['side'].upper()} {trade_volume} lots on {trade_symbol} {label}."
-        autotrade_log.append({
-            "time": datetime.now(timezone.utc).isoformat(),
-            "status": "trade_placed",
-            "decision": {"action": trade_action["side"], "reason": f"Manual command via chat ({placed_on})"},
-            "result": str(result),
-        })
-        del autotrade_log[:-50]
+        if placed_on is None:
+            reply += "\n\n⚠️ Couldn't place the trade — both the real and Exness demo accounts are unavailable right now."
+        else:
+            label = "on your REAL account" if placed_on == "real" else "on your Exness DEMO account"
+            reply += f"\n\n✅ Placed {trade_action['side'].upper()} {trade_volume} lots on {trade_symbol} {label}."
+            autotrade_log.append({
+                "time": datetime.now(timezone.utc).isoformat(),
+                "status": "trade_placed",
+                "decision": {"action": trade_action["side"], "reason": f"Manual command via chat ({placed_on})"},
+                "result": str(result),
+            })
+            del autotrade_log[:-50]
 
     chat_history.append({"role": "user", "text": message})
     chat_history.append({"role": "model", "text": reply})
