@@ -24,8 +24,8 @@
 
     <div class="divider"><span>or</span></div>
 
-    <button class="secondary-btn" onclick="useDemoAccount()">Use Built-in Demo Account</button>
-    <p class="subtitle" style="margin-top:6px;">No MetaApi needed — $5,000 fake balance, real live prices, works exactly like the real thing</p>
+    <button class="secondary-btn" onclick="useDemoAccount()">Use Exness Demo Account</button>
+    <p class="subtitle" style="margin-top:6px;">Connects to your live Exness demo (MT2_LOGIN) — no credentials to type, this is the account the AI council trades on the "demo" leg</p>
   </div>
 </div>
 
@@ -58,7 +58,6 @@
     <section class="card account-card">
       <div class="card-header-row">
         <h2>Account</h2>
-        <button class="ghost-btn" onclick="resetSimAccount()">Reset Demo Balance</button>
       </div>
       <div id="account-info" class="account-stats">—</div>
     </section>
@@ -129,7 +128,7 @@
         </div>
         <button class="ghost-btn" onclick="clearTradeLog()">Clear</button>
       </div>
-      <p class="subtitle">Every trade — manual, chat, or auto, real or demo — with entry, SL/TP, risk:reward, expected & actual P/L. Click a trade to open it on the chart. Click the title to expand/collapse.</p>
+      <p class="subtitle">Every trade — manual, chat, or auto, on either live account — with entry, SL/TP, risk:reward, expected & actual P/L. Click a trade to open it on the chart. Click the title to expand/collapse.</p>
       <div id="trade-log" class="tradelog-list" style="display:none;"></div>
     </section>
 
@@ -163,7 +162,7 @@
       <h2>Council Discussion</h2>
       <button class="icon-btn" onclick="closeCouncilModal()">&times;</button>
     </div>
-    <p class="subtitle">Gemini and Groq scan independently every cycle; DeepSeek reviews before a trade is allowed to fire. Newest first, live while open.</p>
+    <p class="subtitle">Real account: Gemini decides. Demo (Exness) account: Groq picks first, Gemini reviews. DeepSeek reviews both before a trade is allowed to fire. Newest first, live while open.</p>
     <div id="council-feed" class="council-feed"></div>
   </div>
 </div>
