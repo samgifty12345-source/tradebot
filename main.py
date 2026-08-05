@@ -142,6 +142,25 @@ async def connect_start(payload: dict = Body(...), background_tasks: BackgroundT
     return {"requestId": request_id}
 
 
+# ---------------------------------------------------------------------------
+# FIX: this route was missing entirely — app.js's useDemoAccount() calls
+# POST /api/connect-demo-start, but no such route existed anywhere in this
+# file, hence the 404 "Not Found" every time the "Use Exness Demo Account"
+# button was clicked. This mirrors /api/connect-start but pulls credentials
+# from the server's own MT2_LOGIN/MT2_PASSWORD/MT2_SERVER/MT2_PLATFORM env
+# vars instead of the request body, so there's nothing for the user to type.
+# ---------------------------------------------------------------------------
+@app.post("/api/connect-demo-start")
+async def connect_demo_start(background_tasks: BackgroundTasks):
+    if not all([MT2_LOGIN, MT2_PASSWORD, MT2_SERVER]):
+        raise HTTPException(500, "MT2_LOGIN, MT2_PASSWORD, MT2_SERVER env vars must be set for the demo account")
+
+    request_id = uuid.uuid4().hex[:12]
+    _connect_status[request_id] = {"state": "connecting", "accountId": None, "error": None}
+    background_tasks.add_task(_do_connect, request_id, MT2_LOGIN, MT2_PASSWORD, MT2_SERVER, MT2_PLATFORM)
+    return {"requestId": request_id}
+
+
 @app.get("/api/connect-status/{request_id}")
 async def connect_status(request_id: str):
     status = _connect_status.get(request_id)
