@@ -1211,7 +1211,7 @@ def _smart_volume(symbol: str, confidence: float, entry_price=None, sl=None) -> 
 
 # BTCUSD/ETHUSD back on the watchlist now that the demo account is on Exness, which
 # supports crypto (the "real" account still doesn't — see REAL_UNSUPPORTED_SYMBOLS above).
-WATCHLIST = ["XAUUSD", "EURUSD", "GBPUSD", "USDJPY", "AUDUSD", "USDCAD", "BTCUSD", "ETHUSD"]
+WATCHLIST = ["XAUUSD", "EURUSD", "BTCUSD", "ETHUSD"]
 SCAN_TIMEFRAMES = ["15min", "1h", "4h"]  # 30min dropped — it was fetched but never reached the prompt
 MIN_CONFIDENCE = int(os.getenv("MIN_CONFIDENCE", "70"))
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-flash-latest")  # override via env var if needed
