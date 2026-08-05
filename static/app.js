@@ -93,7 +93,35 @@ function initCombo(inputId, listId, onSelect) {
 }
 
 let accountId = localStorage.getItem("accountId");
+if (accountId === "SIM") {
+  // Stale value from before the built-in simulator was removed — it's not a
+  // real MetaApi account id, so hitting /api/account/SIM etc. would just 404.
+  localStorage.removeItem("accountId");
+  accountId = null;
+}
 if (accountId) showDashboard();
+
+async function pollConnectStatus(requestId, statusPrefix) {
+  const maxAttempts = 40; // ~2 min of polling at 3s apart
+  for (let i = 0; i < maxAttempts; i++) {
+    await new Promise((r) => setTimeout(r, 3000));
+    const res = await fetch(`${API_BASE}/api/connect-status/${requestId}`);
+    const data = await res.json();
+
+    if (data.state === "connected") {
+      accountId = data.accountId;
+      localStorage.setItem("accountId", accountId);
+      showDashboard();
+      return;
+    }
+    if (data.state === "error") {
+      document.getElementById("login-status").innerText = "Failed: " + data.error;
+      return;
+    }
+    document.getElementById("login-status").innerText = `${statusPrefix} (${(i + 1) * 3}s)`;
+  }
+  document.getElementById("login-status").innerText = "Still connecting after 2 min — MetaApi may be having issues. Try again shortly.";
+}
 
 async function connectAccount() {
   const login = document.getElementById("login").value;
@@ -114,40 +142,28 @@ async function connectAccount() {
       document.getElementById("login-status").innerText = startData.detail || "Connect failed";
       return;
     }
-
-    const requestId = startData.requestId;
-    const maxAttempts = 40; // ~2 min of polling at 3s apart
-    for (let i = 0; i < maxAttempts; i++) {
-      await new Promise((r) => setTimeout(r, 3000));
-      const res = await fetch(`${API_BASE}/api/connect-status/${requestId}`);
-      const data = await res.json();
-
-      if (data.state === "connected") {
-        accountId = data.accountId;
-        localStorage.setItem("accountId", accountId);
-        showDashboard();
-        return;
-      }
-      if (data.state === "error") {
-        document.getElementById("login-status").innerText = "Failed: " + data.error;
-        return;
-      }
-      document.getElementById("login-status").innerText = `Connecting... (${(i + 1) * 3}s)`;
-    }
-    document.getElementById("login-status").innerText = "Still connecting after 2 min — MetaApi may be having issues. Try again shortly.";
+    await pollConnectStatus(startData.requestId, "Connecting...");
   } catch (err) {
     document.getElementById("login-status").innerText = "Failed: " + err.message;
   }
 }
 
-function useDemoAccount() {
-  accountId = "SIM";
-  localStorage.setItem("accountId", "SIM");
-  showDashboard();
-}
-
-function isSim() {
-  return accountId === "SIM";
+async function useDemoAccount() {
+  // Connects to the live Exness demo account (MT2_LOGIN/MT2_PASSWORD/MT2_SERVER
+  // on the server) — same connect/poll flow as the manual login form, just with
+  // no credentials to type. Replaces the old in-memory simulator.
+  document.getElementById("login-status").innerText = "Connecting to Exness demo... (can take 30-90s first time)";
+  try {
+    const startRes = await fetch(`${API_BASE}/api/connect-demo-start`, { method: "POST" });
+    const startData = await startRes.json();
+    if (!startRes.ok) {
+      document.getElementById("login-status").innerText = startData.detail || "Connect failed";
+      return;
+    }
+    await pollConnectStatus(startData.requestId, "Connecting to Exness demo...");
+  } catch (err) {
+    document.getElementById("login-status").innerText = "Failed: " + err.message;
+  }
 }
 
 function logout(reason) {
@@ -318,6 +334,7 @@ async function refreshAutotradeLog() {
       const decision = entry.decision || {};
       const marketNote = entry.market ? (entry.market.is_open ? "Market: open" : "Market: CLOSED (not enforced yet)") : "";
       const newsNote = entry.news_check || "";
+      const accountNote = entry.account ? `Account: ${entry.account}` : "";
       let statusClass = "at-hold";
       let statusLabel = "HOLD";
       if (entry.status === "trade_placed") { statusClass = "at-trade"; statusLabel = decision.action ? decision.action.toUpperCase() : "TRADE"; }
@@ -337,7 +354,7 @@ async function refreshAutotradeLog() {
           <span class="at-time">${time}</span>
         </div>
         <div class="at-reason">${entry.reason || decision.reason || ""}</div>
-        ${marketNote || newsNote ? `<div class="at-meta">${[marketNote, newsNote].filter(Boolean).join(" · ")}</div>` : ""}
+        ${marketNote || newsNote || accountNote ? `<div class="at-meta">${[accountNote, marketNote, newsNote].filter(Boolean).join(" · ")}</div>` : ""}
         <div id="${detailId}" class="at-detail" style="display:none;">
           ${decision.action ? `<div class="at-detail-row"><strong>Decision:</strong> ${decision.action.toUpperCase()} ${decision.best_symbol || ""} — confidence ${decision.confidence ?? "?"}%</div>` : ""}
           ${decision.stop_loss ? `<div class="at-detail-row"><strong>SL:</strong> ${decision.stop_loss} &nbsp; <strong>TP:</strong> ${decision.take_profit ?? "-"}</div>` : ""}
@@ -359,13 +376,12 @@ async function refreshAutotradeLog() {
 }
 
 async function refreshAccount() {
-  const url = isSim() ? `${API_BASE}/api/sim/account` : `${API_BASE}/api/account/${accountId}`;
-  const res = await fetch(url);
+  const res = await fetch(`${API_BASE}/api/account/${accountId}`);
   if (res.status === 404) { logout("Session expired — please log in again."); return; }
   if (!res.ok) return;
   const info = await res.json();
   document.getElementById("account-info").innerHTML = `
-    <div><span class="stat-label">Balance${isSim() ? " (demo)" : ""}</span>${info.balance} ${info.currency}</div>
+    <div><span class="stat-label">Balance</span>${info.balance} ${info.currency}</div>
     <div><span class="stat-label">Equity</span>${info.equity} ${info.currency}</div>
   `;
 }
@@ -481,8 +497,7 @@ function drawPositionLines(positions) {
 }
 
 async function refreshPositions() {
-  const url = isSim() ? `${API_BASE}/api/sim/positions` : `${API_BASE}/api/positions/${accountId}`;
-  const res = await fetch(url);
+  const res = await fetch(`${API_BASE}/api/positions/${accountId}`);
   if (res.status === 404) { logout("Session expired — please log in again."); return; }
   if (!res.ok) return;
   const positions = await res.json();
@@ -533,8 +548,7 @@ async function trade(side) {
 
   document.getElementById("trade-status").innerText = "Placing order...";
   try {
-    const url = isSim() ? `${API_BASE}/api/sim/trade` : `${API_BASE}/api/trade/${accountId}`;
-    const res = await fetch(url, {
+    const res = await fetch(`${API_BASE}/api/trade/${accountId}`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ symbol, side, volume, sl, tp }),
@@ -638,13 +652,6 @@ async function saveSettings() {
   }
 }
 
-async function resetSimAccount() {
-  if (!confirm("Reset demo balance to $5,000 and clear all open demo positions?")) return;
-  await fetch(`${API_BASE}/api/sim/reset`, { method: "POST" });
-  refreshAccount();
-  refreshPositions();
-}
-
 async function clearTradeLog() {
   if (!confirm("Clear the entire trade log? This can't be undone.")) return;
   await fetch(`${API_BASE}/api/trades`, { method: "DELETE" });
@@ -715,8 +722,7 @@ async function refreshTradeLog() {
 }
 
 async function closePosition(positionId) {
-  const url = isSim() ? `${API_BASE}/api/sim/close/${positionId}` : `${API_BASE}/api/close/${accountId}/${positionId}`;
-  await fetch(url, { method: "POST" });
+  await fetch(`${API_BASE}/api/close/${accountId}/${positionId}`, { method: "POST" });
   refreshPositions();
   refreshAccount();
 }
